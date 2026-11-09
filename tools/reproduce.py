@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-import stat
 from pathlib import Path, PurePosixPath
 import shutil
 import signal
@@ -19,7 +18,7 @@ import zipfile
 
 REPO = Path(os.environ['MINIMAX_REPRO_ROOT']).resolve()
 PACKAGE = 'preliminary_dependencies.zip'
-EXPECTED = '49c78cbcafb7c6d4bf639c77b1b737da833221b80c2c630635b574494b919a33'
+EXPECTED = 'bfcf7b5b629938549dab6303c8fe3c249d8a996f313b9f3048c5f20004409098'
 AFS_DEFAULT = str(REPO / 'work')
 started = time.monotonic()
 deadline = started + 1740
@@ -27,9 +26,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--first-frame', type=Path, default=REPO / 'assets/Golde33443.jpg')
 parser.add_argument('--model-path', type=Path, default=Path(os.environ.get('MODEL_PATH', '/public/home/aclsylqidf/shared/MiniMax-H3')))
 parser.add_argument('--reference-video', type=Path, default=Path(os.environ['REFERENCE_VIDEO']) if os.environ.get('REFERENCE_VIDEO') else REPO / 'examples/reference_fl2va.mp4')
-parser.add_argument('--from-source', action='store_true')
+parser.add_argument('--from-source', action='store_true', default=True,
+                    help='Build from submitted source before inference; this is the default.')
 parser.add_argument('--build-only', action='store_true')
-parser.add_argument('--jobs', type=int, default=2)
+parser.add_argument('--jobs', type=int, default=6)
 parser.add_argument('--verify-only', action='store_true', help='CPU verification on the competition platform; default runs the full eight-card case.')
 args = parser.parse_args()
 afs = Path(os.environ.get('IFAB_AFS_HOME') or AFS_DEFAULT).resolve()
@@ -37,13 +37,14 @@ run_id = datetime.now(timezone.utc).strftime('preliminary_%Y%m%dT%H%M%SZ_') + uu
 output = afs / 'minimax_preliminary_runs' / run_id
 output.mkdir(parents=True, exist_ok=False)
 print('REPRO_OUTPUT_DIRECTORY', output, flush=True)
-print('REPRO_MODE', 'CPU_ONLY' if args.verify_only else 'EIGHT_CARD_FULL_FL2VA', flush=True)
-report = dict(version='preliminary', mode='organized_private_environment',
+print('REPRO_MODE', 'SOURCE_BUILD_AND_CPU_BINDINGS' if args.verify_only else 'SOURCE_BUILD_THEN_EIGHT_CARD_FULL_FL2VA', flush=True)
+report = dict(version='preliminary_source_default', mode='source_build_with_private_dependencies',
               result_directory_id=run_id, platform_run_id=None,
               utc=datetime.now(timezone.utc).isoformat(), cpu_only=args.verify_only,
               status='STARTING', actual_model_executed=False, preliminary_admission_passed=False,
-              source_only_submission=False, compiler_invoked=False, pip_invoked=False,
+              source_only_submission=True, compiler_invoked=False, pip_invoked=False,
               model_weights_included=False, model_deadline_seconds=1740, job_budget_seconds=1800,
+              source_build_required=True, packaged_project_binaries_used=False,
               scheduler_identifiers={k: os.environ[k] for k in ('SLURM_JOB_ID', 'PBS_JOBID', 'LSB_JOBID', 'IFAB_JOB_ID') if os.environ.get(k)})
 scratch = None
 child = None
@@ -78,12 +79,24 @@ def wait_process(command, env, name, limit):
     with (output / name).open('wb') as log:
         child = subprocess.Popen(list(map(str, command)), env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         end = min(deadline, time.monotonic() + limit)
-        while child.poll() is None:
-            if time.monotonic() >= end:
-                stop_tree()
-                raise TimeoutError('Phase deadline: ' + name)
-            print('REPRO_PHASE_RUNNING', name, 'elapsed=' + str(round(time.monotonic() - started, 1)), flush=True)
-            time.sleep(10)
+        with (output / name).open('r', encoding='utf-8', errors='replace') as events:
+            last_heartbeat = 0
+            while True:
+                for line in events.read().splitlines():
+                    print(line, flush=True)
+                code = child.poll()
+                if code is not None:
+                    for line in events.read().splitlines():
+                        print(line, flush=True)
+                    break
+                if time.monotonic() >= end:
+                    stop_tree()
+                    raise TimeoutError('Phase deadline: ' + name)
+                elapsed = time.monotonic() - started
+                if elapsed - last_heartbeat >= 15:
+                    last_heartbeat = elapsed
+                    print('REPRO_PHASE_RUNNING', name, 'elapsed=' + str(round(elapsed, 1)), flush=True)
+                time.sleep(1)
     return child.returncode
 
 def save():
@@ -176,91 +189,62 @@ try:
         report['scratch_attempts'] = attempts
         if scratch is None:
             raise RuntimeError('No writable runtime directory with enough space: ' + str(attempts))
-        phase('extract_prebuilt_runtime')
-        # Recreate internal hardlinks as ordinary files. Platform filesystems can
-        # reject os.link even within one directory; streaming tar cannot seek back.
+        phase('extract_private_python_dependencies')
+        if meta.get('project_precompiled_artifacts_included') is not False or meta.get('official_base_image_included') is not False:
+            raise RuntimeError('Expected the dependency-only source-build environment')
         extracted_files = set()
-        copied_hardlinks = 0
         with z.open('runtime.tar.xz') as stream, tarfile.open(fileobj=stream, mode='r|xz') as t:
             for member in t:
                 path = PurePosixPath(member.name)
-                if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != 'runtime' or '\\' in member.name:
-                    raise RuntimeError('Unsafe runtime path')
-                if not (member.isfile() or member.isdir() or member.islnk()):
-                    raise RuntimeError('Unexpected runtime object type')
-                if member.islnk():
-                    link = PurePosixPath(member.linkname)
-                    if link.is_absolute() or '..' in link.parts or not link.parts or link.parts[0] != 'runtime' or '\\' in member.linkname:
-                        raise RuntimeError('Unsafe runtime hardlink')
-                    source = scratch.joinpath(*link.parts)
-                    target = scratch.joinpath(*path.parts)
-                    if member.linkname not in extracted_files or source.is_symlink() or not source.is_file():
-                        raise RuntimeError('Hardlink source must be an earlier extracted regular file')
-                    if not source.resolve().is_relative_to(scratch.resolve()) or not target.resolve().is_relative_to(scratch.resolve()):
-                        raise RuntimeError('Hardlink path escapes runtime directory')
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    # No os.link and no t.extractfile(member), which would seek back.
-                    with source.open('rb') as src, target.open('xb') as dst:
-                        shutil.copyfileobj(src, dst, length=1024 * 1024)
-                    target.chmod(stat.S_IMODE(source.stat().st_mode) & 0o755)
-                    copied_hardlinks += 1
+                allowed = member.name.startswith('runtime/site/') or member.name in {
+                    'runtime', 'runtime/site', 'runtime/files.json',
+                    'runtime/provenance.json', 'runtime/setup.json'}
+                if path.is_absolute() or '..' in path.parts or '\\' in member.name or not allowed:
+                    raise RuntimeError('Unexpected dependency-only runtime path')
+                if not (member.isfile() or member.isdir()):
+                    raise RuntimeError('Runtime dependencies must contain regular files or directories')
+                if member.name in extracted_files:
+                    raise RuntimeError('Duplicate dependency file')
+                t.extract(member, scratch, filter='data')
+                if member.isfile():
                     extracted_files.add(member.name)
-                else:
-                    t.extract(member, scratch, filter='data')
-                    if member.isfile():
-                        extracted_files.add(member.name)
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Runtime extraction exceeded the job deadline')
-        report['hardlinks_materialized_as_regular_copies'] = copied_hardlinks
-        print('REPRO_HARDLINK_COPIES', copied_hardlinks, flush=True)
+        report['environment_contains_project_binaries'] = False
+        report['environment_contains_official_image'] = False
     root = scratch / 'runtime'
-    phase('verify_prebuilt_files')
+    phase('verify_private_python_dependencies')
     inventory = json.loads((root / 'files.json').read_text())
     if len(inventory['files']) != meta['files']:
         raise RuntimeError('Runtime inventory count differs')
-    for item in inventory['files']:
+    dependency_files = [item for item in inventory['files'] if item['path'].startswith('site/')]
+    if not dependency_files:
+        raise RuntimeError('Missing private dependency inventory')
+    for item in dependency_files:
         p = root / item['path']
         if not p.resolve().is_relative_to(root.resolve()) or p.stat().st_size != item['bytes'] or digest(p) != item['sha256']:
             raise RuntimeError('Runtime file differs: ' + item['path'])
-    report['verified_files'] = len(inventory['files'])
+    report['verified_dependency_files'] = len(dependency_files)
+    report['archive_inventory_records'] = len(inventory['files'])
     report['runtime_payload_sha256'] = meta['runtime_payload_sha256']
     for name in ('provenance.json', 'setup.json', 'files.json'):
         shutil.copyfile(root / name, output / name)
     if digest(args.first_frame) != '1e71abf29876f248088a11211a350ed3d26a0c68aa34f6e45738771eb2d45a22':
         raise RuntimeError('Use the original public-case first frame')
-    shutil.copyfile(args.first_frame, root / 'helpers/Golde33443.jpg')
-    contract = root / 'helpers/case_contract.py'
-    if str(args.model_path) != '/public/home/aclsylqidf/shared/MiniMax-H3':
-        text = contract.read_text()
-        old_path = repr('/public/home/aclsylqidf/shared/MiniMax-H3')
-        if text.count(old_path) != 1:
-            raise RuntimeError('Unexpected model path contract')
-        contract.write_text(text.replace(old_path, repr(str(args.model_path))))
-        report['model_path_override'] = str(args.model_path)
-    shutil.copyfile(root / 'helpers/integration_manifest.json', output / 'integration_manifest.json')
-    command = [sys.executable, '-u', str(root / 'helpers/supervisor.py'), '--env-root', str(afs), '--output', str(output), '--mode', 'candidate']
-    if args.verify_only:
-        command.append('--verify-only')
-    report['command'] = command
+    report['model_path'] = str(args.model_path)
     env = os.environ.copy()
-    # Use the exact original successful entry's variable names. The frozen
-    # cache adapter copies this environment; its ROTARY_ROOT/RMS_ROOT aliases
-    # do not enable the native H3_ROTARY_ROOT/RMS_NORM_ROOT routes.
-    sys.path.insert(0, str(root / 'helpers'))
-    from modes import ROOT_VARIABLES
-    roles = ('cast', 'rotary', 'mrope', 'silu', 'swiglu', 'rms')
-    if len(ROOT_VARIABLES) != len(roles):
-        raise RuntimeError('Original native backend environment mapping differs')
-    native_roots = {variable: str(root / 'assets' / role) for variable, role in zip(ROOT_VARIABLES, roles)}
-    native_roots['INFINICORE_NINETOOTHED_MHA_ROOT'] = str(root / 'assets/mha')
-    env.update(native_roots)
-    report['native_backend_environment'] = native_roots
-    for variable, value in native_roots.items():
-        print('REPRO_BACKEND_ROOT', variable, value, flush=True)
+    # The source-run entry sets all seven native roots from rebuilt_assets and
+    # verifies its bindings belong to this build. Do not inherit cached routes.
+    for variable in list(env):
+        if variable.startswith('INFINICORE_NINETOOTHED_') and variable.endswith('_ROOT'):
+            env.pop(variable)
+    for variable in ('INFINI_ROOT', 'MINIMAX_PORTABLE_ROOT', 'MINIMAX_PYTHON_RUNTIME_SITE',
+                     'MINIMAX_PYTHON_AUX_ROOT', 'MINIMAX_RMS_PROBE_ROOT', 'MINIMAX_RMS_PROBE_PHASE'):
+        env.pop(variable, None)
     env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2',
                TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch))
     env.update(PYTHONPATH=str(root / 'site'), PIP_NO_INDEX='1', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
-    source_mode = args.from_source or args.build_only
+    source_mode = True
     if source_mode:
         report['source_build_requested'] = True
         report['compiler_invoked'] = None
@@ -268,6 +252,7 @@ try:
         build_base = Path(os.environ.get('BUILD_WORK', str(afs / ('minimax_preliminary_source_' + EXPECTED[:12])))).resolve()
         build_base.mkdir(parents=True, exist_ok=True)
         work = build_base / 'outputs'
+        report['source_build_resuming'] = (work / 'build_report.json').is_file()
         build_deps = extract_build(package, build_base / 'dependencies')
         tools = build_deps / 'tools'
         rc = build_deps / 'xmake-offline.lua'
@@ -293,9 +278,9 @@ try:
             raise RuntimeError('Source build failed; return complete result ZIP')
         if args.build_only:
             report['source_build_complete'] = True
-            raise Checkpoint('Source build completed; submit --from-source to run inference')
-        if deadline - time.monotonic() < 650:
-            raise Checkpoint('Build completed; insufficient inference budget remains. Repeat --from-source.')
+            raise Checkpoint('Source build completed; repeat bash reproduce.sh to run inference')
+        if not args.verify_only and deadline - time.monotonic() < 650:
+            raise Checkpoint('Build completed; insufficient inference budget remains. Repeat bash reproduce.sh.')
         phase('source_built_inference')
         command = [sys.executable, '-u', REPO / 'source_rebuild/run.py', '--from-build', work, '--first-frame', args.first_frame, '--model-path', args.model_path, '--env-root', output / 'source_run']
         if args.verify_only:
@@ -347,6 +332,8 @@ try:
         report['actual_model_executed'] = model.get('actual_model_executed', False)
         report['actual_h3_calls'] = model.get('actual_h3_calls')
         report['model_wall_seconds'] = model.get('model_wall_seconds')
+        if source_mode:
+            report['source_entry_wall_seconds'] = model.get('entry_wall_seconds')
     expected_status = 'LOCAL_PUBLIC_FL2VA_CPU_VERIFIED_GPU_PENDING' if args.verify_only else 'PUBLIC_FIRST_FRAME_SEVEN_NINE_MHA_GENERATION_VERIFIED_COMPLIANCE_PENDING'
     if source_mode:
         expected_status = 'SOURCE_BINDINGS_CPU_VERIFIED_GPU_PENDING' if args.verify_only else 'SOURCE_BUILT_PUBLIC_GENERATION_VERIFIED'
@@ -356,11 +343,17 @@ try:
     if args.reference_video and not args.verify_only:
         phase('official_fl2va_comparison')
         candidate = next((output / 'source_run').rglob('public_dog.mp4')) if source_mode else output / 'public_dog.mp4'
+        comparator = work / 'src/InfiniLM/examples/minimax_h3_compare.py'
+        if digest(comparator) != 'e2c1dea3bc9f0c91e729d662f4dd7d5dcf3aebdd78cc02f9cbb61b816f425461':
+            raise RuntimeError('Official comparator differs from the submitted source snapshot')
+        report['official_comparator_sha256'] = digest(comparator)
         compare_env = dict(env, PYTHONPATH=str(root / 'site'))
-        code = wait_process([sys.executable, root / 'release/examples/minimax_h3_compare.py', '--tasks', 'fl2va', '--reference-fl2va-video', args.reference_video, '--infinilm-fl2va-video', candidate, '--model-path', args.model_path, '--output-dir', output / 'official_comparison'], compare_env, 'official_compare.log', max(1, deadline - time.monotonic() - 20))
+        code = wait_process([sys.executable, comparator, '--tasks', 'fl2va', '--reference-fl2va-video', args.reference_video, '--infinilm-fl2va-video', candidate, '--model-path', args.model_path, '--output-dir', output / 'official_comparison'], compare_env, 'official_compare.log', max(1, deadline - time.monotonic() - 20))
         report['official_comparison_exit_code'] = code
         if code:
             raise RuntimeError('Official comparison failed; return result ZIP')
+        report['official_comparison_status'] = 'COMPLETED'
+        report['status'] = 'SOURCE_BUILD_FL2VA_AND_OFFICIAL_COMPARISON_COMPLETED_COMPLIANCE_PENDING'
     else:
         report['official_comparison_status'] = 'NOT_RUN_NO_REFERENCE_VIDEO' if not args.verify_only else 'NOT_RUN_CPU_ONLY'
     exit_code = 0

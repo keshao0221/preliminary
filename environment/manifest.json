@@ -1,9 +1,21 @@
 {
   "schema": 1,
-  "runtime_payload_sha256": "48ae499f80349bc523a9406557802ad16d962ecaebab7c0999441c82696d6e64",
-  "build_payload_sha256": "3e9345fefdf36985d1d4785ce92c269d32b6a44936c84df2beb382a06956cd77",
-  "files": 4669,
-  "unpacked_bytes": 698539844,
+  "purpose": "Dependencies for source compilation and source-built execution",
+  "original_environment_sha256": "49c78cbcafb7c6d4bf639c77b1b737da833221b80c2c630635b574494b919a33",
+  "archives": {
+    "runtime.tar.xz": {
+      "bytes": 63811288,
+      "sha256": "b5380f08207b3274a08c3006c2bcbde790982b6c4899fa9018add265a5a9e913"
+    },
+    "build.tar.xz": {
+      "bytes": 67685928,
+      "sha256": "b83f0767217e0fdcea19ce42af27bcccc680f3f01e953318843637783cc78797"
+    }
+  },
+  "runtime_payload_sha256": "b5380f08207b3274a08c3006c2bcbde790982b6c4899fa9018add265a5a9e913",
+  "build_payload_sha256": "b83f0767217e0fdcea19ce42af27bcccc680f3f01e953318843637783cc78797",
+  "files": 3510,
+  "unpacked_bytes": 297730978,
   "runtime_packages": [
     {
       "name": "accelerate",
@@ -64,74 +76,16 @@
       "version": "0.26.0"
     }
   ],
-  "metric_packages": [
-    "scipy==1.11.4",
-    "scikit-image==0.25.2",
-    "imageio==2.37.0",
-    "lazy-loader==0.4",
-    "tifffile==2025.6.11"
-  ],
-  "inherited_provided": [
-    {
-      "name": "torch",
-      "version": "2.9.0+das.opt1.dtk2604",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "numpy",
-      "version": "1.25.0",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "transformers",
-      "version": "4.57.6",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "huggingface-hub",
-      "version": "0.36.0",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "tokenizers",
-      "version": "0.22.2",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "safetensors",
-      "version": "0.7.0",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "pillow",
-      "version": "12.2.0",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "packaging",
-      "version": "26.0",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "PyYAML",
-      "version": "6.0.3",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "psutil",
-      "version": "7.2.2",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    },
-    {
-      "name": "networkx",
-      "version": "3.6.1",
-      "location": "/usr/local/lib/python3.11/site-packages"
-    }
-  ],
-  "prebuilt_native_cache_included": true,
-  "source_rebuild_available": true,
-  "original_v24_platform_verified": true,
-  "organized_environment_platform_verified": false,
-  "archive_sha256": "49c78cbcafb7c6d4bf639c77b1b737da833221b80c2c630635b574494b919a33",
-  "archive_bytes": 148950040
+  "project_framework_extensions_included": false,
+  "project_native_libraries_included": false,
+  "project_hsaco_kernels_included": false,
+  "third_party_compiler_binaries_included": true,
+  "note": "Build toolchain and third-party libraries are dependencies; all project framework/operator outputs must be built from submitted source.",
+  "archive_hardlinks_materialized": true,
+  "compiler_dependency_file_bytes_changed": false,
+  "official_base_image_included": false,
+  "model_weights_included": false,
+  "project_precompiled_artifacts_included": false,
+  "environment_mode": "missing_third_party_dependencies_only",
+  "previous_precompiled_environment_replaced": true
 }
