@@ -1,0 +1,11 @@
+# Restored Release dependency attachment
+/dependencies/
+/work/
+/build/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db
+*.tmp
+/minimax_h3_preliminary_offline_dependencies_v1.zip

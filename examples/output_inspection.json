@@ -1,0 +1,63 @@
+{
+  "status": "PUBLIC_CASE_MEDIA_AND_FINITE_LATENTS_VERIFIED",
+  "video": {
+    "width": 576,
+    "height": 384,
+    "fps": 24.0,
+    "codec": "h264",
+    "decoded_frames": 124,
+    "bytes": 654304,
+    "sha256": "f940dcb2288cf19e9608a417e864f8cdde17893c9b46e4bd14adccf1095a48b5"
+  },
+  "audio": {
+    "channels": 2,
+    "sample_rate": 32000,
+    "codec": "aac",
+    "decoded_samples": 165888,
+    "decoded_finite": true
+  },
+  "artifacts": {
+    "denoised_latents.safetensors": {
+      "bytes": 3122168,
+      "sha256": "2404a572fccb49194798fa35024893915fc50740355dbbe8021240be2f095204",
+      "tensors": {
+        "audio_latents": {
+          "shape": [
+            2,
+            32,
+            207
+          ],
+          "dtype": "torch.float32"
+        },
+        "latents": {
+          "shape": [
+            1,
+            24,
+            37,
+            24,
+            36
+          ],
+          "dtype": "torch.float32"
+        }
+      }
+    },
+    "condition_latents.safetensors": {
+      "bytes": 83032,
+      "sha256": "fe3409bde9f710d52951caa209fd27b91e43b06acabe53ef65fb31896a6ef9ed",
+      "tensors": {
+        "first": {
+          "shape": [
+            1,
+            24,
+            1,
+            24,
+            36
+          ],
+          "dtype": "torch.float32"
+        }
+      }
+    }
+  },
+  "similarity_to_reference_verified": false,
+  "preliminary_admission_passed": false
+}

@@ -1,0 +1,145 @@
+{
+  "provider": "competition_current_environment",
+  "automatic_installation": false,
+  "automatic_upgrade": false,
+  "policy": "Check the project APIs and CPU compatibility probes; do not enforce the former bundled wheel lock.",
+  "vendor": {
+    "torch": "2.9.0+das.opt1.dtk2604",
+    "hip": "6.3.26093",
+    "cxx11_abi": true
+  },
+  "compile": {
+    "required_modules": {
+      "ninetoothed": "ninetoothed",
+      "triton": "triton",
+      "numpy": "numpy",
+      "sympy": "sympy"
+    },
+    "tools": [
+      "xmake",
+      "g++"
+    ],
+    "apis": {
+      "ninetoothed": [
+        "Tensor"
+      ],
+      "ninetoothed.generation": [
+        "CodeGenerator"
+      ],
+      "triton": [
+        "compile"
+      ],
+      "triton.compiler": [
+        "ASTSource"
+      ],
+      "triton.backends.compiler": [
+        "GPUTarget"
+      ]
+    },
+    "probes": [
+      "numpy_torch"
+    ],
+    "notes": [
+      "NumPy 1.25 is checked through the used APIs. Full kernel generation and LLVM ABI checks remain mandatory in build.py."
+    ]
+  },
+  "runtime": {
+    "required_modules": {
+      "diffusers": "diffusers",
+      "transformers": "transformers",
+      "huggingface-hub": "huggingface_hub",
+      "accelerate": "accelerate",
+      "numpy": "numpy",
+      "safetensors": "safetensors",
+      "pillow": "PIL",
+      "av": "av"
+    },
+    "tools": [],
+    "apis": {
+      "transformers": [
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLProcessor",
+        "Qwen2TokenizerFast"
+      ],
+      "huggingface_hub": [
+        "hf_hub_download",
+        "snapshot_download",
+        "split_torch_state_dict_into_shards"
+      ],
+      "accelerate": [
+        "dispatch_model",
+        "infer_auto_device_map",
+        "init_empty_weights"
+      ],
+      "accelerate.utils": [
+        "set_module_tensor_to_device"
+      ],
+      "safetensors.torch": [
+        "load_file",
+        "save_file"
+      ],
+      "safetensors": [
+        "safe_open"
+      ],
+      "diffusers": [
+        "MiniMaxH3Transformer3DModel",
+        "AutoencoderKLMiniMaxH3",
+        "AutoencoderKLMiniMaxH3Audio",
+        "MiniMaxH3Scheduler",
+        "ModularPipeline"
+      ],
+      "diffusers.modular_pipelines.minimax_h3": [
+        "MiniMaxH3ImageReference"
+      ],
+      "diffusers.models.attention_dispatch": [
+        "attention_backend"
+      ],
+      "diffusers.utils.export_utils": [
+        "encode_video"
+      ],
+      "av": [
+        "open",
+        "VideoFrame"
+      ]
+    },
+    "optional_modules": {
+      "torchvision": "torchvision",
+      "torchaudio": "torchaudio"
+    },
+    "probes": [
+      "numpy_torch",
+      "safetensors",
+      "pillow"
+    ],
+    "notes": [
+      "This public FL2VA input is a first-frame image without audio references. The existing pipeline imports torchaudio lazily only for input sample-rate conversion."
+    ]
+  },
+  "metrics": {
+    "required_modules": {
+      "numpy": "numpy",
+      "scipy": "scipy",
+      "scikit-image": "skimage",
+      "imageio": "imageio",
+      "lazy-loader": "lazy_loader",
+      "networkx": "networkx",
+      "tifffile": "tifffile",
+      "pillow": "PIL",
+      "av": "av"
+    },
+    "tools": [],
+    "apis": {
+      "skimage.metrics": [
+        "structural_similarity"
+      ],
+      "av": [
+        "open",
+        "VideoFrame"
+      ]
+    },
+    "probes": [
+      "numpy_torch",
+      "ssim"
+    ]
+  }
+}

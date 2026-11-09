@@ -1,0 +1,306 @@
+{
+  "package_id": "MINIMAX_H3_SOURCE_REBUILD_STAGED_INSTALL_20261109",
+  "source_only": true,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 9,
+      "sha256": "8b9c3028d6467ff3be7c793141927841d70f47f52d0590677438f488ca154992"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 185,
+      "sha256": "d21a414ee58c920ec5c27daac3e62e04a07dc0670dbdf477614d7d5cbbb9d257"
+    },
+    {
+      "path": "build.py",
+      "bytes": 11769,
+      "sha256": "b191d1379c470af6706f2167387ba656902433229c7e7ac4c75651779e54af4d"
+    },
+    {
+      "path": "compare_fl2va_saved.py",
+      "bytes": 1937,
+      "sha256": "7560f27d77f021decc305c8e09ccfc031508e19ff44e50c5ea48b9ea0bbb7a78"
+    },
+    {
+      "path": "config/build.json",
+      "bytes": 302,
+      "sha256": "62e75a2fd87c6ac4bd21381850e09db4cecabe75363a53253e0186d0986f4618"
+    },
+    {
+      "path": "config/platform_requirements.json",
+      "bytes": 3368,
+      "sha256": "c4dde3b05e7c291b70e835c57ad468f551d10e283f0c55104c17dbddf4e79b85"
+    },
+    {
+      "path": "config/run.json",
+      "bytes": 438,
+      "sha256": "0a4082415cdfc3391c1ac1e7a9cb9593707d69d0f8360ffdbf4b60d300028385"
+    },
+    {
+      "path": "README.md",
+      "bytes": 138,
+      "sha256": "ad8e6e9d030e353c3e37888e27544ab2fb763f4772c1b2664c0403b4b51be254"
+    },
+    {
+      "path": "run.py",
+      "bytes": 7195,
+      "sha256": "19d057a2bb5ad4d577ec77284a8d86752af7b52c0636cf49083110e1dcc0b458"
+    },
+    {
+      "path": "runtime/case_contract.py",
+      "bytes": 2696,
+      "sha256": "05d0a5940b681c7372ea30983c35f70ff1d1ab6c3d0e46f7e22616587bb70e2c"
+    },
+    {
+      "path": "runtime/cast_observer_base.py",
+      "bytes": 5099,
+      "sha256": "f48264658f88f7e9cd51e1d864c04233d722467fead7b3421512ed180aa8fea8"
+    },
+    {
+      "path": "runtime/five_counters.py",
+      "bytes": 2524,
+      "sha256": "02e0619fccf41a931098f2bb227b2d35666e21a2a9a28e0cb29fa51d19b8ee27"
+    },
+    {
+      "path": "runtime/inspect_run.py",
+      "bytes": 2806,
+      "sha256": "ee46a55b651d94145cfe865ee319641ef5ef41b4d2e20ab1641981fc9a5542fd"
+    },
+    {
+      "path": "runtime/inventory.py",
+      "bytes": 1099,
+      "sha256": "109212f35bf66146fa9d974ff2f376be428fc1e690cf7d7ea16355118c5b6063"
+    },
+    {
+      "path": "runtime/mha_contract.py",
+      "bytes": 4193,
+      "sha256": "36a255950d869168b7dfbaff5ed47c3544b5e2d4fdf151a57633b6f434e9d77d"
+    },
+    {
+      "path": "runtime/mha_model_observer.py",
+      "bytes": 3558,
+      "sha256": "9c1079e94dd450f848a92697f0685f1049d7bcdf121ce25e63fa33d377d78ccd"
+    },
+    {
+      "path": "runtime/model_counts.py",
+      "bytes": 1201,
+      "sha256": "e0085b6abee613d11eb3d685acd3d989ebb9f1681c711ee252e0feb899a00b28"
+    },
+    {
+      "path": "runtime/model_wrapper.py",
+      "bytes": 2716,
+      "sha256": "7ba903f012384190d8cad3e3f36a198c443c930f26a226a06b90090f00bf0d32"
+    },
+    {
+      "path": "runtime/modes.py",
+      "bytes": 1304,
+      "sha256": "537e4549365a0e7ff49913b30456b6e92bb159350ccdc4a27aef170e0ab7643a"
+    },
+    {
+      "path": "runtime/native_bridge.py",
+      "bytes": 7052,
+      "sha256": "b7720cedbe47c4e5280a217427f25820373d77ee51d5808c69817cbd0319857c"
+    },
+    {
+      "path": "runtime/observer.py",
+      "bytes": 4625,
+      "sha256": "9d0f39366fd5dd9cc8de49595f633e9308c5d3194b5855ea9ee706c4c073b051"
+    },
+    {
+      "path": "runtime/official_compare_reference.py",
+      "bytes": 28708,
+      "sha256": "e143c28e4b3acb885662e0aa238aa00ca17cbcc82077f465f2ce57d0f1225590"
+    },
+    {
+      "path": "runtime/pair_observer_base.py",
+      "bytes": 5566,
+      "sha256": "2614ae5039bfa48a5ec3cbb6c4eaed5d9c4158ae933db0ce85a062a46727509a"
+    },
+    {
+      "path": "runtime/quad_counters.py",
+      "bytes": 2477,
+      "sha256": "c636eb4ea3202151464fd67457893fada7d2f13df5a03070f251a83ac3d64b9c"
+    },
+    {
+      "path": "runtime/rocblas_runtime.py",
+      "bytes": 3297,
+      "sha256": "9a154a29b778ab7a51b1520654678218cf3293ee7ff080b521e0ffc2c0857e5c"
+    },
+    {
+      "path": "runtime/sample_observer.py",
+      "bytes": 11959,
+      "sha256": "54d7b3e08caa2be051e480c17203072a32d5cc486dbe08f96286704a30203950"
+    },
+    {
+      "path": "runtime/six_counters.py",
+      "bytes": 2712,
+      "sha256": "a967d9bcdf34a28187ded7735c9239058b9c3ad41e1fe637c549525d6c76a6e2"
+    },
+    {
+      "path": "runtime/trio_observer_base.py",
+      "bytes": 7622,
+      "sha256": "69e13c2068e277a6bf955cf6c4f7947e8614df6e1f54b4e8129a4014eb769281"
+    },
+    {
+      "path": "runtime/vae_silu_bridge.py",
+      "bytes": 3933,
+      "sha256": "6732b3012225392477ccb59b28a17d008d7d5fede0eefc5671343864fbd7dd6c"
+    },
+    {
+      "path": "runtime/vae_silu_contract.py",
+      "bytes": 2022,
+      "sha256": "072a8ca278579df9b49789e8c7b653b1db25226eec50b9d1f8e9546b15cdefd3"
+    },
+    {
+      "path": "runtime/vae_silu_inventory.py",
+      "bytes": 1715,
+      "sha256": "f741d0aae5d54fda24cfe1c6b1e0ec51684abe7736651c8559a5814adff860cf"
+    },
+    {
+      "path": "source/native_sources.zip",
+      "bytes": 18462997,
+      "sha256": "1b6207f1638214ac7e8a89ca0aea0957a49fd2b5df89ea260ea45e643a58274c"
+    },
+    {
+      "path": "source/operators/cast/build_kernels.py",
+      "bytes": 6461,
+      "sha256": "fd00860788965b0b5a35b4e1aff5ca0de75c6b8a356371b6382d30fd141d3b49"
+    },
+    {
+      "path": "source/operators/cast/cast_definition.py",
+      "bytes": 414,
+      "sha256": "b2a3490fdbcc455d87228affc83e29b7dc69646aebd4bb348263327fc7812c20"
+    },
+    {
+      "path": "source/operators/cast/host_runtime.cpp",
+      "bytes": 4011,
+      "sha256": "2e673f34e79ca96706ff2a60bb3ceb00c5f396ec44e8b2977712f9419002512d"
+    },
+    {
+      "path": "source/operators/mha/backend_compat.py",
+      "bytes": 1469,
+      "sha256": "db672a9fdf4592c4ea8b2f0493c2ad1a857d1cfd16a36c9ce3d09f0b0edd093b"
+    },
+    {
+      "path": "source/operators/mha/build_kernels.py",
+      "bytes": 6118,
+      "sha256": "1ff3591a8e5608db81acfd210d1f06a5ae2663b8d67ac1321ed879dba52a3b62"
+    },
+    {
+      "path": "source/operators/mha/host_runtime.cpp",
+      "bytes": 2538,
+      "sha256": "5d632c6cb6c2ad124c731bb56bd264cedc1cfa3db04c0e6b19b8802cba5f6969"
+    },
+    {
+      "path": "source/operators/mha/mha_definition.py",
+      "bytes": 3092,
+      "sha256": "cfe017488afa19d223d4ca509de86972731b78d29336c6e8ca57d94dad43bcd3"
+    },
+    {
+      "path": "source/operators/mrope/build_kernels.py",
+      "bytes": 5423,
+      "sha256": "1661d3467c92f7191adbc356c8e5dd2a366cfc08f4c0982400dc0aee357c04f4"
+    },
+    {
+      "path": "source/operators/mrope/host_runtime.cpp",
+      "bytes": 4025,
+      "sha256": "89c159f5152fdbd391311c9139c4e40e8b815a3c3259b6ec889ddbda5b7ead9e"
+    },
+    {
+      "path": "source/operators/mrope/mrope_definition.py",
+      "bytes": 2166,
+      "sha256": "a869588d7f613b746e75e289a30f45d680822f2bcfa4cca86d645263fa538efb"
+    },
+    {
+      "path": "source/operators/rms/build_kernels.py",
+      "bytes": 6218,
+      "sha256": "7930ec06a47564f0a21243707fa48a277a07e805f1d5ed710cae6c6edb4d1dc4"
+    },
+    {
+      "path": "source/operators/rms/host_runtime.cpp",
+      "bytes": 3398,
+      "sha256": "208f5102876b45bd77842bf86df9b1d25b7f14146d90c349b45b1e8fd99c9539"
+    },
+    {
+      "path": "source/operators/rms/rms_norm_definition.py",
+      "bytes": 2633,
+      "sha256": "2eea479911afb901409e65eabe1c0777454d58b1ea6b2f262175b41378805c8c"
+    },
+    {
+      "path": "source/operators/rotary/build_kernels.py",
+      "bytes": 5898,
+      "sha256": "0fe1076be4ce9120fa2f2b27a39222f15a67d79746506294a411a51bb6111f0c"
+    },
+    {
+      "path": "source/operators/rotary/host_runtime.cpp",
+      "bytes": 3315,
+      "sha256": "cf8ff9632a73ad2569bd677444f08e3ed8e3ad0beba21464ff8510fc6ad9fea1"
+    },
+    {
+      "path": "source/operators/rotary/rotary_definition.py",
+      "bytes": 893,
+      "sha256": "5838d6b2dd78de0e29ccb633e32dc13156cb5e5b241755bf48197825286ad8cd"
+    },
+    {
+      "path": "source/operators/silu/build_kernels.py",
+      "bytes": 6489,
+      "sha256": "e02c1a8d31253da072f7ab6ea29db90a9993f0da33a56818aed0e73deea648a6"
+    },
+    {
+      "path": "source/operators/silu/host_runtime.cpp",
+      "bytes": 3222,
+      "sha256": "f4f0f0615a294fb456f884f6a3f5a20ce7ffb9de10f3bfacc6599bec194c5b07"
+    },
+    {
+      "path": "source/operators/silu/silu_definition.py",
+      "bytes": 668,
+      "sha256": "6a2771cc8b10edb5117fbaafa70825fa956472b7537fac5cb27cc34ccb87e3eb"
+    },
+    {
+      "path": "source/operators/swiglu/build_kernels.py",
+      "bytes": 6580,
+      "sha256": "12aba4e8d22e21e3da1d97b659504dddee031ef1411f0f96cd1dc0b8dbbe0d91"
+    },
+    {
+      "path": "source/operators/swiglu/host_runtime.cpp",
+      "bytes": 3242,
+      "sha256": "bc0c89315fed63d1a3ae749e37f5a66bb9cc04fe412c800faa34802bcf9f0d78"
+    },
+    {
+      "path": "source/operators/swiglu/swiglu_definition.py",
+      "bytes": 1192,
+      "sha256": "938f08311e9be6249438025ff9028779a5c0ecad0ab1ece9da4ee0312f15d657"
+    },
+    {
+      "path": "source/patches/InfiniCore.patch",
+      "bytes": 117839,
+      "sha256": "0d984f8ac3ae163b8586b601baac0ea1db888e3ad1e887b5d5467c407feada1e"
+    },
+    {
+      "path": "source/patches/InfiniLM.patch",
+      "bytes": 59385,
+      "sha256": "4fbaa0e456cd7f84e73b0e03d11fd9d32eb9857ae8ed44e764d47d3f9b5b93c2"
+    },
+    {
+      "path": "tools/build_outputs.py",
+      "bytes": 3755,
+      "sha256": "3a186b89c176037a13dac15d5c33a45a23bce1895098b37c5c7020d73c97912f"
+    },
+    {
+      "path": "tools/platform_api.py",
+      "bytes": 7459,
+      "sha256": "05cd3573e36ae5af4972b4cdad0c80dcbf3dec2b8587300db7b3eca8634eb75b"
+    },
+    {
+      "path": "tools/platform_environment.py",
+      "bytes": 1737,
+      "sha256": "1442a89d5376089401dab5ae13401e550ee25ba5a7077f9c58455f5cfd93812b"
+    },
+    {
+      "path": "verify.py",
+      "bytes": 2516,
+      "sha256": "995fa4ca85965e73c636e681306e6e656af7f1ffd02ccf8155603b3411cd7ff9"
+    }
+  ]
+}

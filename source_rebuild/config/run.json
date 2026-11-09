@@ -1,0 +1,9 @@
+{
+  "model_source_sha256": "d7fb5db2b51dbb34538177d3ae9e34c6984e4907aaa9b5551c5c64baa2564886",
+  "torch_h3_source_sha256": "45f1d4a4e9e72128f0d6c5b5d66379b61131a354b58d2776280a83f6c89f8d51",
+  "expected_h3_calls": 9,
+  "official_comparator_sha256": "e143c28e4b3acb885662e0aa238aa00ca17cbcc82077f465f2ce57d0f1225590",
+  "public_mode": "candidate",
+  "model_mode": "candidate",
+  "model_path": "/public/home/aclsylqidf/shared/MiniMax-H3"
+}

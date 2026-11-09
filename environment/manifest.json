@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "runtime_payload_sha256": "48ae499f80349bc523a9406557802ad16d962ecaebab7c0999441c82696d6e64",
+  "build_payload_sha256": "3e9345fefdf36985d1d4785ce92c269d32b6a44936c84df2beb382a06956cd77",
+  "files": 4669,
+  "unpacked_bytes": 698539844,
+  "runtime_packages": [
+    {
+      "name": "accelerate",
+      "version": "1.14.0"
+    },
+    {
+      "name": "av",
+      "version": "16.1.0"
+    },
+    {
+      "name": "diffusers",
+      "version": "0.40.0.dev0"
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9"
+    },
+    {
+      "name": "httpx",
+      "version": "0.28.1"
+    },
+    {
+      "name": "janus",
+      "version": "2.0.0"
+    },
+    {
+      "name": "markdown-it-py",
+      "version": "4.2.0"
+    },
+    {
+      "name": "mdurl",
+      "version": "0.1.2"
+    },
+    {
+      "name": "rich",
+      "version": "15.0.0"
+    },
+    {
+      "name": "shellingham",
+      "version": "1.5.4"
+    },
+    {
+      "name": "typer",
+      "version": "0.27.3"
+    },
+    {
+      "name": "xxhash",
+      "version": "4.0.2"
+    }
+  ],
+  "build_packages": [
+    {
+      "name": "triton",
+      "version": "3.5.1+das.opt1.dtk2604.torch290"
+    },
+    {
+      "name": "ninetoothed",
+      "version": "0.26.0"
+    }
+  ],
+  "metric_packages": [
+    "scipy==1.11.4",
+    "scikit-image==0.25.2",
+    "imageio==2.37.0",
+    "lazy-loader==0.4",
+    "tifffile==2025.6.11"
+  ],
+  "inherited_provided": [
+    {
+      "name": "torch",
+      "version": "2.9.0+das.opt1.dtk2604",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "numpy",
+      "version": "1.25.0",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "transformers",
+      "version": "4.57.6",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "huggingface-hub",
+      "version": "0.36.0",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "tokenizers",
+      "version": "0.22.2",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "safetensors",
+      "version": "0.7.0",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "pillow",
+      "version": "12.2.0",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "packaging",
+      "version": "26.0",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "PyYAML",
+      "version": "6.0.3",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "psutil",
+      "version": "7.2.2",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    },
+    {
+      "name": "networkx",
+      "version": "3.6.1",
+      "location": "/usr/local/lib/python3.11/site-packages"
+    }
+  ],
+  "prebuilt_native_cache_included": true,
+  "source_rebuild_available": true,
+  "original_v24_platform_verified": true,
+  "organized_environment_platform_verified": false,
+  "archive_sha256": "49c78cbcafb7c6d4bf639c77b1b737da833221b80c2c630635b574494b919a33",
+  "archive_bytes": 148950040
+}

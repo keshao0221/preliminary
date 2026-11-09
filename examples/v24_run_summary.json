@@ -1,0 +1,25 @@
+{
+  "result_id": "ready_v24_20261109T095454Z_02f517fc",
+  "status": "FULL_FL2VA_COMPLETED_COMPLIANCE_PENDING",
+  "model_wall_seconds": 181.75480573810637,
+  "total_seconds": 429.226,
+  "actual_h3_calls": 9,
+  "mha_total_launches": 3744,
+  "mha_per_device_launches": {
+    "0": 468,
+    "1": 468,
+    "2": 468,
+    "3": 468,
+    "4": 468,
+    "5": 468,
+    "6": 468,
+    "7": 468
+  },
+  "video_vae_silu_counts": {
+    "video_vae_encode": 150,
+    "video_vae_decode": 1512
+  },
+  "tested_environment": "v24 full paired private environment; new missing-only package awaits platform validation",
+  "official_comparison": "not received",
+  "full_model_compliance": "pending"
+}

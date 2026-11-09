@@ -1,0 +1,64 @@
+{
+  "status": "SAVED_VIDEO_COMPARISON_COMPLETED",
+  "video": {
+    "exact": false,
+    "left_metadata": {
+      "width": 576,
+      "height": 384,
+      "declared_frames": 124,
+      "average_fps": 24.0,
+      "duration_seconds": 5.166666666666667
+    },
+    "right_metadata": {
+      "width": 576,
+      "height": 384,
+      "declared_frames": 124,
+      "average_fps": 24.0,
+      "duration_seconds": 5.166666666666667
+    },
+    "metadata_size_match": true,
+    "decoded_length_match": true,
+    "left_frames": 124,
+    "right_frames": 124,
+    "shape_mismatches": 0,
+    "different_elements": 68971196,
+    "compared_elements": 82280448,
+    "max_absolute_difference": 161,
+    "mean_absolute_difference": 3.182866602768133,
+    "ssim_match_percent": 96.73843335599614,
+    "ssim_min_percent": 95.1238602561653,
+    "ssim_max_percent": 98.3438716821116,
+    "ssim_method": "grayscale frames scaled to at most 512 pixels per side"
+  },
+  "reference_sha256": "e743ed9066ad1f5384e9fcb1107e9a7a55bf2af9094b185ba842736b68c6c24c",
+  "candidate_sha256": "f940dcb2288cf19e9608a417e864f8cdde17893c9b46e4bd14adccf1095a48b5",
+  "official_comparator_sha256": "e2c1dea3bc9f0c91e729d662f4dd7d5dcf3aebdd78cc02f9cbb61b816f425461",
+  "official_comparator_unmodified": true,
+  "reference_origin": "Historical project PyTorch public-case output h3pubref4_20261102T093125Z_589aa7a4",
+  "reference_archive_sha256": "063627c1605d05fd14e398920f10e95d0ccd205418e92c19a404d73a16589d0e",
+  "reference_is_organizer_standard_file": false,
+  "reference_parameters": {
+    "prompt": "A dog falls asleep",
+    "steps": 10,
+    "seed": 42,
+    "width": 576,
+    "height": 384,
+    "frames": 124,
+    "fps": 24
+  },
+  "new_model_or_gpu_execution": false,
+  "organized_reproduction_entry_executed": false,
+  "analysis_environment": {
+    "numpy": "1.26.4",
+    "scipy": "1.11.4",
+    "scikit-image": "0.25.2",
+    "av": "16.1.0",
+    "Pillow": "12.2.0"
+  },
+  "formal_acceptance": false,
+  "official_threshold": null,
+  "full_model_speedup_verified": false,
+  "analysis_os": "Windows",
+  "analysis_python": "CPython 3.12",
+  "analysis_only_not_inference_environment": true
+}

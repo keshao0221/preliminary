@@ -1,0 +1,10 @@
+{
+  "native_sources_sha256": "1b6207f1638214ac7e8a89ca0aea0957a49fd2b5df89ea260ea45e643a58274c",
+  "python": "3.11",
+  "torch": "2.9.0+das.opt1.dtk2604",
+  "hip": "6.3.26093",
+  "target": "gfx936",
+  "cxx11_abi": 1,
+  "source_only": true,
+  "offline_dependencies_provider": "competition_environment"
+}

@@ -1,0 +1,16 @@
+{
+  "reference_sha256": "e743ed9066ad1f5384e9fcb1107e9a7a55bf2af9094b185ba842736b68c6c24c",
+  "reference_origin": "Historical project PyTorch public-case output h3pubref4_20261102T093125Z_589aa7a4",
+  "reference_archive_sha256": "063627c1605d05fd14e398920f10e95d0ccd205418e92c19a404d73a16589d0e",
+  "reference_is_organizer_standard_file": false,
+  "reference_parameters": {
+    "prompt": "A dog falls asleep",
+    "steps": 10,
+    "seed": 42,
+    "width": 576,
+    "height": 384,
+    "frames": 124,
+    "fps": 24
+  },
+  "formal_acceptance": false
+}

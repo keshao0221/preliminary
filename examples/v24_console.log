@@ -1,0 +1,185 @@
+# Public sample log; personal AFS path replaced with ${IFAB_AFS_HOME}.
+READY_V24_OUTPUT_DIRECTORY ${IFAB_AFS_HOME}/minimax_v24_ready_runs/ready_v24_20261109T095454Z_02f517fc
+READY_V24_MODE EIGHT_CARD_FULL_FL2VA
+READY_V24_PHASE check_upload elapsed_seconds=0.0
+READY_V24_PHASE extract_prebuilt_runtime elapsed_seconds=0.5
+READY_V24_HARDLINK_COPIES 142
+READY_V24_PHASE verify_prebuilt_files elapsed_seconds=14.3
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_CAST_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/cast
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_H3_ROTARY_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/rotary
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_MROPE_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/mrope
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_SILU_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/silu
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_SWIGLU_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/swiglu
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_RMS_NORM_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/rms
+READY_V24_BACKEND_ROOT INFINICORE_NINETOOTHED_MHA_ROOT /dev/shm/infinifabric-preparation/shell-d36990c73dcd4711bc07e3b68f46a3c2/minimax_ready_v24_4rnof3rs/runtime/assets/mha
+READY_V24_PHASE load_bindings_then_infer elapsed_seconds=17.8
+READY_V24_HEARTBEAT elapsed_seconds=17.8 latest_log=runtime.log bytes=0
+H3_PUBLIC_PHASE cpu_binding_image_and_layout_checks
+READY_V24_HEARTBEAT elapsed_seconds=33.1 latest_log=local_check.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=48.3 latest_log=local_check.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=63.3 latest_log=public_cpu_check.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=78.5 latest_log=public_cpu_check.log bytes=140
+H3_PUBLIC_PHASE rocblas_catalog_and_eight_device_gemm
+READY_V24_HEARTBEAT elapsed_seconds=93.5 latest_log=rocblas_probe.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=108.6 latest_log=rocblas_probe.log bytes=0
+H3_MULTI_BLAS_CASE_BEGIN 0 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 0 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 0 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 0 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 0 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 0 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 0 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 0
+H3_MULTI_BLAS_CASE_BEGIN 1 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 1 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 1 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 1 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 1 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 1 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 1 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 1
+H3_MULTI_BLAS_CASE_BEGIN 2 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 2 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 2 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 2 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 2 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 2 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 2 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 2
+H3_MULTI_BLAS_CASE_BEGIN 3 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 3 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 3 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 3 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 3 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 3 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 3 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 3
+READY_V24_HEARTBEAT elapsed_seconds=124.0 latest_log=rocblas_probe.log bytes=3144
+H3_MULTI_BLAS_CASE_BEGIN 4 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 4 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 4 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 4 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 4 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 4 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 4 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 4
+H3_MULTI_BLAS_CASE_BEGIN 5 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 5 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 5 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 5 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 5 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 5 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 5 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 5
+H3_MULTI_BLAS_CASE_BEGIN 6 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 6 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 6 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 6 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 6 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 6 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 6 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 6
+H3_MULTI_BLAS_CASE_BEGIN 7 float32 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 float32 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 float32 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 7 float32 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 7 float16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 float16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 float16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 7 float16 infinicore 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 7 bfloat16 torch 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 bfloat16 infinicore 32 64 48
+H3_MULTI_BLAS_CASE_BEGIN 7 bfloat16 torch 8 5376 128
+H3_MULTI_BLAS_CASE_BEGIN 7 bfloat16 infinicore 8 5376 128
+H3_MULTI_BLAS_DEVICE_COMPLETED 7
+H3_PUBLIC_PHASE six_nine_eight_device_preflight
+READY_V24_HEARTBEAT elapsed_seconds=139.4 latest_log=runtime.log bytes=5586
+READY_V24_HEARTBEAT elapsed_seconds=154.4 latest_log=runtime.log bytes=5586
+READY_V24_HEARTBEAT elapsed_seconds=169.4 latest_log=runtime.log bytes=5586
+READY_V24_HEARTBEAT elapsed_seconds=184.4 latest_log=vae_silu_preflight.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=199.4 latest_log=vae_silu_preflight.log bytes=0
+H3_PUBLIC_PHASE mha_new_core_eight_device_preflight
+READY_V24_HEARTBEAT elapsed_seconds=214.6 latest_log=runtime.log bytes=5638
+READY_V24_HEARTBEAT elapsed_seconds=230.1 latest_log=runtime.log bytes=5638
+H3_PUBLIC_PHASE candidate_weights_and_public_first_frame_generation
+READY_V24_HEARTBEAT elapsed_seconds=245.3 latest_log=minimax_h3_full.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=260.3 latest_log=minimax_h3_full.log bytes=0
+READY_V24_HEARTBEAT elapsed_seconds=275.3 latest_log=minimax_h3_full.log bytes=1531
+READY_V24_HEARTBEAT elapsed_seconds=290.3 latest_log=minimax_h3_full.log bytes=3164
+READY_V24_HEARTBEAT elapsed_seconds=305.3 latest_log=minimax_h3_full.log bytes=5967
+READY_V24_HEARTBEAT elapsed_seconds=320.3 latest_log=minimax_h3_full.log bytes=10186
+H3_PUBLIC_FIRST_FRAME_ENCODED candidate
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 1
+READY_V24_HEARTBEAT elapsed_seconds=335.9 latest_log=runtime.log bytes=5787
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 1
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 1
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 2
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 2
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 2
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 3
+READY_V24_HEARTBEAT elapsed_seconds=351.2 latest_log=runtime.log bytes=6041
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 3
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 3
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 4
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 4
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 4
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 5
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 5
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 5
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 6
+READY_V24_HEARTBEAT elapsed_seconds=366.5 latest_log=minimax_h3_full.log bytes=11677
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 6
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 6
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 7
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 7
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 7
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 8
+READY_V24_HEARTBEAT elapsed_seconds=381.6 latest_log=runtime.log bytes=6676
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 8
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 8
+H3_PUBLIC_REAL_H3_CALL_BEGIN candidate 9
+H3_PUBLIC_REAL_H3_CALL_COMPLETED candidate 9
+H3_PUBLIC_MHA_CALL_COMPLETED candidate 9
+READY_V24_HEARTBEAT elapsed_seconds=396.6 latest_log=runtime.log bytes=6889
+READY_V24_HEARTBEAT elapsed_seconds=411.6 latest_log=minimax_h3_full.log bytes=14567
+H3_PUBLIC_MHA_COMPLETED 3744
+H3_PUBLIC_VAE_SILU_COMPLETED {"video_vae_encode": 150, "video_vae_decode": 1512}
+READY_V24_RESULT_ZIP ${IFAB_AFS_HOME}/minimax_v24_ready_runs/ready_v24_20261109T095454Z_02f517fc.zip
+READY_V24_RESULT_SHA256 cddfcbd0924152fe2d92670d61209a1f573d716a17bfca8244a76cb15e66163e
+READY_V24_STATUS FULL_FL2VA_COMPLETED_COMPLIANCE_PENDING
+READY_V24_TOTAL_SECONDS 429.226

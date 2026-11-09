@@ -1,0 +1,56 @@
+// HIP host module/cache/stream glue only; all SwiGLU math is NineToothed code.
+#include <hip/hip_runtime_api.h>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+namespace {
+struct Module { hipModule_t module; hipFunction_t function; };
+std::mutex mutex;
+std::unordered_map<std::string,Module> modules;
+std::array<std::atomic<uint64_t>,7> stats{};
+std::array<std::array<std::atomic<uint64_t>,10>,64> per_device{};
+thread_local std::string error;
+void check(hipError_t status) { if(status!=hipSuccess) throw std::string(hipGetErrorString(status)); }
+int type_index(const std::string &path) {
+    const std::array<std::string,3> types{"f32","f16","bf16"};
+    for(int i=0;i<3;++i) if(path.find("/"+types[i]+"/")!=std::string::npos) return i;
+    throw std::string("Unknown SwiGLU dtype path");
+}
+}
+extern "C" const char *minimax_nine_swiglu_error() { return error.c_str(); }
+extern "C" void minimax_nine_swiglu_statistics(uint64_t *values) { for(size_t i=0;i<7;++i) values[i]=stats[i].load(); }
+extern "C" void minimax_nine_swiglu_device_statistics(int device,uint64_t *values) {
+    for(size_t i=0;i<10;++i) values[i]=(device>=0 && device<64)?per_device[device][i].load():0;
+}
+extern "C" int minimax_nine_swiglu_launch(const char *binary,int rank,unsigned grid,void *stream,void **arguments) {
+    error.clear();
+    try {
+        if(!binary || !stream || !arguments || !grid || (rank!=1 && rank!=8)) throw std::string("Invalid SwiGLU host arguments");
+        int device=-1; check(hipGetDevice(&device));
+        if(device<0 || device>=64) throw std::string("SwiGLU diagnostic capacity exceeded");
+        const int type=type_index(binary); hipFunction_t function=nullptr; auto &local=per_device[device];
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto key=std::to_string(device)+":"+binary; const auto found=modules.find(key);
+            if(found==modules.end()) {
+                hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop,device));
+                const std::string arch=prop.gcnArchName;
+                if(arch.substr(0,arch.find(':'))!="gfx936" || prop.warpSize!=64) throw std::string("Expected gfx936/warp64");
+                hipModule_t module=nullptr; check(hipModuleLoad(&module,binary));
+                const auto result=hipModuleGetFunction(&function,module,"minimax_nine_swiglu");
+                if(result!=hipSuccess) { (void)hipModuleUnload(module); check(result); }
+                modules.emplace(key,Module{module,function}); ++stats[1]; ++local[1];
+            } else function=found->second.function;
+        }
+        check(hipModuleLaunchKernel(function,grid,1,1,256,1,1,0,static_cast<hipStream_t>(stream),arguments,nullptr));
+        ++stats[0]; stats[2]=reinterpret_cast<uintptr_t>(stream); stats[3]=device; ++stats[rank==1?4:5]; stats[6]=grid;
+        ++local[0]; local[2]=reinterpret_cast<uintptr_t>(stream); local[3]=device; ++local[rank==1?4:5]; local[6]=grid; ++local[7+type];
+        return 0;
+    } catch(const std::string &value) { error=value; }
+      catch(const std::exception &value) { error=value.what(); }
+      catch(...) { error="Unknown SwiGLU host exception"; }
+    return 1;
+}

@@ -1,0 +1,2847 @@
+--- a/InfiniCore/src/infinicore/ops/cast/cast.cc
++++ b/InfiniCore/src/infinicore/ops/cast/cast.cc
+@@ -3,6 +3,7 @@
+ #include "../../utils.hpp"
+ #include "infinicore/context/context.hpp"
+ #include "infinicore/graph/graph.hpp"
++#include "ninetoothed/cast_ninetoothed.hpp"
+ 
+ #include <functional>
+ #include <limits>
+@@ -91,7 +92,11 @@
+     }
+ #endif
+ #if defined(ENABLE_ATEN)
+-    adaptor::set_aten_stream_to_infinicore();
++    // A CPU tensor needs no accelerator stream, including in Hygon builds
++    // whose ATen stream adapter otherwise initializes HIP unconditionally.
++    if (out->device().getType() != Device::Type::CPU) {
++        adaptor::set_aten_stream_to_infinicore();
++    }
+     auto output_at = adaptor::to_aten_tensor(out);
+     const auto input_at = adaptor::to_aten_tensor(in);
+     output_at.copy_(input_at);
+@@ -107,6 +112,11 @@
+         throw std::runtime_error("cast_ expects equal non-empty shapes");
+     }
+     INFINICORE_ASSERT_TENSORS_SAME_DEVICE(out, in);
++    if (out->device().getType() == Device::Type::HYGON
++        && cast_impl::ninetoothed::enabled()) {
++        cast_impl::ninetoothed::execute(out, in);
++        return;
++    }
+     record_or_run([out, in] { run_cast(out, in); });
+ }
+ 
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/cast/ninetoothed/cast_layout.hpp
+@@ -0,0 +1,121 @@
++#pragma once
++// Host metadata normalization only; all device conversion is NineToothed code.
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <utility>
++#include <vector>
++
++namespace infinicore::op::cast_impl::ninetoothed {
++struct Layout {
++    std::array<int64_t, 8> shape{}, input_strides{}, output_strides{};
++    uint64_t elements = 0, input_span = 0, output_span = 0;
++    uint32_t grid = 0;
++    int rank = 1;
++};
++
++inline uint64_t checked_add(uint64_t a, uint64_t b) {
++    if (b > uint64_t(INT64_MAX) || a > uint64_t(INT64_MAX) - b) throw std::invalid_argument("NineToothed Cast metadata exceeds int64");
++    return a + b;
++}
++inline uint64_t checked_mul(uint64_t a, uint64_t b) {
++    if (b && a > uint64_t(INT64_MAX) / b) throw std::invalid_argument("NineToothed Cast metadata exceeds int64");
++    return a * b;
++}
++
++inline Layout normalize_layout(const std::vector<size_t> &shape,
++    const std::vector<ptrdiff_t> &input_strides, const std::vector<ptrdiff_t> &output_strides) {
++    if (shape.size() > 8 || shape.size() != input_strides.size() || shape.size() != output_strides.size())
++        throw std::invalid_argument("NineToothed Cast supports matching metadata of rank 0 through 8");
++    Layout result;
++    result.shape.fill(1); result.input_strides.fill(0); result.output_strides.fill(0);
++    bool empty = false;
++    for (size_t i = 0; i < shape.size(); ++i) {
++        if (shape[i] > uint64_t(INT64_MAX) || input_strides[i] < 0 || output_strides[i] < 0)
++            throw std::invalid_argument("NineToothed Cast requires nonnegative int64 sizes and strides");
++        empty = empty || shape[i] == 0;
++    }
++    if (empty) { result.shape[7] = 0; return result; }
++    result.elements = 1;
++    uint64_t input_last = 0, output_last = 0;
++    std::vector<std::pair<uint64_t, uint64_t>> output_axes;
++    std::vector<int64_t> sizes, in, out;
++    for (size_t i = 0; i < shape.size(); ++i) {
++        result.elements = checked_mul(result.elements, shape[i]);
++        input_last = checked_add(input_last, checked_mul(shape[i] - 1, input_strides[i]));
++        output_last = checked_add(output_last, checked_mul(shape[i] - 1, output_strides[i]));
++        if (shape[i] > 1) {
++            sizes.push_back(static_cast<int64_t>(shape[i]));
++            in.push_back(input_strides[i]); out.push_back(output_strides[i]);
++            output_axes.emplace_back(output_strides[i], shape[i]);
++        }
++    }
++    // A sufficient non-overlap check allows transposes, permutations and holes.
++    // Ambiguous overlapping output views are rejected before any GPU launch.
++    std::sort(output_axes.begin(), output_axes.end());
++    uint64_t covered = 1;
++    for (const auto &axis : output_axes) {
++        if (axis.first < covered) throw std::invalid_argument("NineToothed Cast output view may overlap");
++        covered = checked_add(covered, checked_mul(axis.second - 1, axis.first));
++    }
++    result.input_span = checked_add(input_last, 1);
++    result.output_span = checked_add(output_last, 1);
++    for (size_t i = sizes.size(); i > 1; --i) {
++        const size_t j = i - 2;
++        if (uint64_t(in[j]) == checked_mul(in[j+1], sizes[j+1]) &&
++            uint64_t(out[j]) == checked_mul(out[j+1], sizes[j+1])) {
++            sizes[j] = static_cast<int64_t>(checked_mul(sizes[j], sizes[j+1]));
++            in[j] = in[j+1]; out[j] = out[j+1];
++            sizes.erase(sizes.begin()+j+1); in.erase(in.begin()+j+1); out.erase(out.begin()+j+1);
++        }
++    }
++    if (sizes.empty()) { sizes.push_back(1); in.push_back(1); out.push_back(1); }
++    const size_t start = 8 - sizes.size();
++    for (size_t i = 0; i < sizes.size(); ++i) {
++        result.shape[start+i] = sizes[i];
++        result.input_strides[start+i] = in[i]; result.output_strides[start+i] = out[i];
++    }
++    result.rank = sizes.size() == 1 ? 1 : 8;
++    uint64_t grid = 1 + (uint64_t(result.shape[7]) - 1) / 256;
++    for (size_t i = 0; i < 7; ++i) grid = checked_mul(grid, result.shape[i]);
++    if (grid > INT32_MAX) throw std::invalid_argument("NineToothed Cast grid exceeds supported x dimension");
++    result.grid = static_cast<uint32_t>(grid);
++    return result;
++}
++
++inline bool byte_ranges_overlap(uintptr_t input, uint64_t input_span, size_t input_bytes,
++    uintptr_t output, uint64_t output_span, size_t output_bytes) {
++    const uint64_t a = checked_mul(input_span, input_bytes), b = checked_mul(output_span, output_bytes);
++    if (a > UINTPTR_MAX - input || b > UINTPTR_MAX - output)
++        throw std::invalid_argument("NineToothed Cast address range overflow");
++    return input < output + b && output < input + a;
++}
++
++struct LaunchArguments {
++    std::array<void *,2> data;
++    std::array<int64_t,32> scalars{};
++    std::array<void *,36> arguments{};
++    void *global_scratch = nullptr, *profile_scratch = nullptr;
++    LaunchArguments(const Layout &layout, void *input, void *output) : data{input,output} {
++        const int rank = layout.rank;
++        for (int tensor = 0; tensor < 2; ++tensor) {
++            const int base = tensor*(1+2*rank);
++            arguments[base] = &data[tensor];
++            for (int dim = 0; dim < rank; ++dim) {
++                const int index = 8-rank+dim;
++                scalars[tensor*2*rank+dim] = layout.shape[index];
++                scalars[tensor*2*rank+rank+dim] = tensor ? layout.output_strides[index] : layout.input_strides[index];
++                arguments[base+1+dim] = &scalars[tensor*2*rank+dim];
++                arguments[base+1+rank+dim] = &scalars[tensor*2*rank+rank+dim];
++            }
++        }
++        arguments[2+4*rank] = &global_scratch;
++        arguments[3+4*rank] = &profile_scratch;
++    }
++    LaunchArguments(const LaunchArguments &) = delete;
++    LaunchArguments &operator=(const LaunchArguments &) = delete;
++};
++} // namespace infinicore::op::cast_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/cast/ninetoothed/cast_ninetoothed.cc
+@@ -0,0 +1,96 @@
++#include "cast_ninetoothed.hpp"
++#include "cast_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++
++namespace infinicore::op::cast_impl::ninetoothed {
++namespace {
++using Launch = int (*)(const char *, int, unsigned, void *, void **);
++using Error = const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex;
++    // Keep modules and the host library alive through asynchronous launches and
++    // recorded-operator replay. They are released by the OS at process exit.
++    static std::unordered_map<std::string, Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = cache.find(root);
++    if (found != cache.end()) return found->second;
++    auto handle = dlopen((root+"/libminimax_nine_cast_runtime.so").c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (!handle) throw std::runtime_error(std::string("NineToothed Cast runtime load failed: ")+dlerror());
++    auto launch = reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_cast_launch"));
++    auto error = reinterpret_cast<Error>(dlsym(handle,"minimax_nine_cast_error"));
++    if (!launch || !error) { dlclose(handle); throw std::runtime_error("NineToothed Cast runtime ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root;
++    throw std::runtime_error("NineToothed Cast precompiled backend currently requires Linux");
++#endif
++}
++
++const char *dtype_name(DataType dtype) {
++    switch (dtype) {
++    case DataType::F32: return "f32";
++    case DataType::F16: return "f16";
++    case DataType::BF16: return "bf16";
++    default: throw std::invalid_argument("Enabled NineToothed Cast supports F32, F16 and BF16 only; no numerical fallback");
++    }
++}
++
++class CastOperator final : public graph::GraphOperator {
++    graph::GraphTensor output_, input_;
++    Layout layout_;
++    std::string root_, binary_;
++public:
++    CastOperator(Tensor output, const Tensor &input, std::string root)
++        : output_(output), input_(input),
++          layout_(normalize_layout(output->shape(),input->strides(),output->strides())), root_(std::move(root)) {
++        const std::string pair = std::string(dtype_name(input->dtype()))+"_to_"+dtype_name(output->dtype());
++        binary_ = root_+"/rank"+std::to_string(layout_.rank)+"/kernels/"+pair+"/kernel.hsaco";
++    }
++    // Retain graph-operator replay, and let Graph segment this host-managed
++    // launch outside device capture. No unsupported capture claim is made.
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if (!layout_.elements) return;
++        auto output = output_, input = input_;
++        const auto device = output->device();
++        if (context::getDevice() != device) context::setDevice(device);
++        if (input->data() == output->data() && input->dtype() == output->dtype()
++            && input->strides() == output->strides()) return;
++        if (byte_ranges_overlap(reinterpret_cast<uintptr_t>(input->data()),layout_.input_span,input->element_size(),
++                reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++            throw std::invalid_argument("NineToothed Cast rejects aliased input/output spans");
++        LaunchArguments launch(layout_,input->data(),output->data());
++        auto &host = runtime(root_);
++        if (host.launch(binary_.c_str(),layout_.rank,layout_.grid,context::getStream(),launch.arguments.data()))
++            throw std::runtime_error(std::string("NineToothed Cast launch failed: ")+host.error());
++    }
++};
++} // namespace
++
++bool enabled() {
++    const char *root = std::getenv("INFINICORE_NINETOOTHED_CAST_ROOT");
++    return root && root[0];
++}
++
++void execute(Tensor output, const Tensor &input) {
++    const char *root = std::getenv("INFINICORE_NINETOOTHED_CAST_ROOT");
++    if (!root || !root[0]) throw std::runtime_error("NineToothed Cast root is not configured");
++    auto op = std::make_shared<CastOperator>(output,input,root);
++    if (context::isGraphRecording()) context::addGraphOperator(op);
++    else op->run();
++}
++} // namespace infinicore::op::cast_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/cast/ninetoothed/cast_ninetoothed.hpp
+@@ -0,0 +1,7 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++
++namespace infinicore::op::cast_impl::ninetoothed {
++bool enabled();
++void execute(Tensor output, const Tensor &input);
++} // namespace infinicore::op::cast_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/dist/dist.cc
+@@ -0,0 +1,30 @@
++#include "infinicore/ops/dist.hpp"
++
++#include "../../utils.hpp"
++
++#include <stdexcept>
++
++namespace infinicore::op {
++
++INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(Dist);
++
++Dist::Dist(Tensor y, const Tensor &x1, const Tensor &x2, double p) {
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y, x1, x2);
++    INFINICORE_GRAPH_OP_DISPATCH(y->device().getType(), y, x1, x2, p);
++}
++
++void Dist::execute(Tensor y, const Tensor &x1, const Tensor &x2, double p) {
++    INFINICORE_GRAPH_OP_RECORD_OR_RUN(Dist, y, x1, x2, p);
++}
++
++Tensor dist(const Tensor &x1, const Tensor &x2, double p) {
++    auto y = Tensor::empty({}, x1->dtype(), x1->device());
++    dist_(y, x1, x2, p);
++    return y;
++}
++
++void dist_(Tensor y, const Tensor &x1, const Tensor &x2, double p) {
++    Dist::execute(y, x1, x2, p);
++}
++
++} // namespace infinicore::op
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/dist/dist_infiniop.cc
+@@ -0,0 +1,52 @@
++#include "infinicore/ops/dist.hpp"
++
++#include "../infiniop_impl.hpp"
++
++namespace infinicore::op::dist_impl::infiniop {
++
++INFINIOP_CACHABLE_DESCRIPTOR(Descriptor, Dist, 100);
++
++struct PlannedMeta {
++    std::shared_ptr<Descriptor> descriptor;
++    graph::GraphTensor workspace, y, x1, x2;
++};
++
++void *plan(Tensor y, const Tensor &x1, const Tensor &x2, double p) {
++    size_t seed = hash_combine(y, x1, x2, p);
++
++    INFINIOP_CACHABLE_DESCRIPTOR_GET_OR_CREATE(
++        Descriptor, descriptor, Dist,
++        seed,
++        y->desc(), x1->desc(), x2->desc(), p);
++
++    INFINIOP_WORKSPACE_TENSOR(workspace, Dist, descriptor);
++
++    return new PlannedMeta{
++        descriptor,
++        graph::GraphTensor(workspace),
++        graph::GraphTensor(y),
++        graph::GraphTensor(x1),
++        graph::GraphTensor(x2)};
++}
++
++void run(void *planned_meta) {
++    auto *p = reinterpret_cast<PlannedMeta *>(planned_meta);
++
++    INFINICORE_CHECK_ERROR(infiniopDist(
++        p->descriptor->desc,
++        p->workspace ? p->workspace->data() : nullptr,
++        p->workspace ? p->workspace->numel() : 0,
++        p->y->data(),
++        p->x1->data(),
++        p->x2->data(),
++        context::getStream()));
++}
++
++void cleanup(void **planned_meta_ptr) {
++    delete *reinterpret_cast<PlannedMeta **>(planned_meta_ptr);
++    *planned_meta_ptr = nullptr;
++}
++
++INFINICORE_GRAPH_OP_REGISTER_ALLDEVICE(Dist, &plan, &run, &cleanup);
++
++} // namespace infinicore::op::dist_impl::infiniop
+--- a/InfiniCore/src/infinicore/ops/h3_rotary_cache/h3_rotary_cache.cc
++++ b/InfiniCore/src/infinicore/ops/h3_rotary_cache/h3_rotary_cache.cc
+@@ -1,6 +1,7 @@
+ #include "infinicore/ops/h3_rotary_cache.hpp"
+ 
+ #include "../../utils.hpp"
++#include "ninetoothed/h3_rotary_ninetoothed.hpp"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -67,6 +68,11 @@
+     if (position_ids->size(0) == 0) {
+         return;
+     }
++    if (output->device().getType() == Device::Type::HYGON
++        && h3_rotary_cache_impl::ninetoothed::enabled()) {
++        h3_rotary_cache_impl::ninetoothed::execute(output,position_ids,rope_theta);
++        return;
++    }
+     if (!H3RotaryCache::plan_dispatcher().lookup(output->device().getType())) {
+         throw std::runtime_error("h3_rotary_cache has no backend for this device");
+     }
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/h3_rotary_cache/ninetoothed/h3_rotary_ninetoothed.cc
+@@ -0,0 +1,78 @@
++#include "h3_rotary_ninetoothed.hpp"
++#include "rotary_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++
++namespace infinicore::op::h3_rotary_cache_impl::ninetoothed {
++namespace {
++using Launch=int(*)(const char *,unsigned,void *,void **);
++using Error=const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex;
++    static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    const auto found=cache.find(root); if (found!=cache.end()) return found->second;
++    auto handle=dlopen((root+"/libminimax_nine_rotary_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if (!handle) throw std::runtime_error(std::string("NineToothed rotary host load failed: ")+dlerror());
++    auto launch=reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_rotary_launch"));
++    auto error=reinterpret_cast<Error>(dlsym(handle,"minimax_nine_rotary_error"));
++    if (!launch || !error) { dlclose(handle); throw std::runtime_error("NineToothed rotary host ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root; throw std::runtime_error("Precompiled NineToothed rotary currently requires Linux");
++#endif
++}
++const char *dtype_name(DataType type) {
++    switch(type) {
++    case DataType::I32:return "i32"; case DataType::I64:return "i64";
++    case DataType::F16:return "f16"; case DataType::BF16:return "bf16";
++    case DataType::F32:return "f32"; case DataType::F64:return "f64";
++    default:throw std::invalid_argument("Unsupported NineToothed rotary dtype; no numerical fallback");
++    }
++}
++class RotaryOperator final : public graph::GraphOperator {
++    graph::GraphTensor output_,positions_;
++    Layout layout_;
++    float theta_;
++    std::string root_,binary_;
++public:
++    RotaryOperator(Tensor output,const Tensor &positions,float theta,std::string root)
++        : output_(output),positions_(positions),
++          layout_(prepare_layout(positions->size(0),output->size(1)/6,positions->stride(0),positions->stride(1),theta)),theta_(theta),root_(std::move(root)) {
++        binary_=root_+"/kernels/"+dtype_name(positions->dtype())+"_to_"+dtype_name(output->dtype())+"/kernel.hsaco";
++    }
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if (!layout_.rows) return;
++        auto output=output_,positions=positions_;
++        if (context::getDevice()!=output->device()) context::setDevice(output->device());
++        if (byte_ranges_overlap(reinterpret_cast<uintptr_t>(positions->data()),layout_.input_span,positions->element_size(),
++                reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++            throw std::invalid_argument("NineToothed rotary rejects aliased position/output spans");
++        LaunchArguments arguments(layout_,positions->data(),output->data(),output->element_size(),theta_);
++        auto &host=runtime(root_);
++        if (host.launch(binary_.c_str(),layout_.grid,context::getStream(),arguments.arguments.data()))
++            throw std::runtime_error(std::string("NineToothed rotary launch failed: ")+host.error());
++    }
++};
++}
++bool enabled() {
++    const auto root=std::getenv("INFINICORE_NINETOOTHED_H3_ROTARY_ROOT"); return root && root[0];
++}
++void execute(Tensor output,const Tensor &positions,float theta) {
++    const auto root=std::getenv("INFINICORE_NINETOOTHED_H3_ROTARY_ROOT");
++    if (!root || !root[0]) throw std::runtime_error("NineToothed rotary root missing");
++    auto op=std::make_shared<RotaryOperator>(output,positions,theta,root);
++    if (context::isGraphRecording()) context::addGraphOperator(op); else op->run();
++}
++} // namespace infinicore::op::h3_rotary_cache_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/h3_rotary_cache/ninetoothed/h3_rotary_ninetoothed.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++namespace infinicore::op::h3_rotary_cache_impl::ninetoothed {
++bool enabled();
++void execute(Tensor output,const Tensor &positions,float theta);
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/h3_rotary_cache/ninetoothed/rotary_layout.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++// Host layout/ABI only. Device frequencies and trigonometry are NineToothed.
++#include "../../cast/ninetoothed/cast_layout.hpp"
++#include <cmath>
++
++namespace infinicore::op::h3_rotary_cache_impl::ninetoothed {
++using cast_impl::ninetoothed::checked_add;
++using cast_impl::ninetoothed::checked_mul;
++using cast_impl::ninetoothed::byte_ranges_overlap;
++struct Layout {
++    int64_t rows, dim, stride0, stride1;
++    uint64_t input_span, output_span;
++    unsigned grid;
++};
++inline Layout prepare_layout(uint64_t rows,uint64_t dim,int64_t stride0,int64_t stride1,float theta) {
++    if (rows>INT64_MAX || !dim || dim>uint64_t(INT64_MAX)/6 || stride0<0 || stride1<0 || !(theta>0) || !std::isfinite(theta))
++        throw std::invalid_argument("NineToothed H3 rotary requires nonnegative int64 layout, positive frequency dimension and finite positive theta");
++    const auto width=checked_mul(6,dim);
++    const auto output=checked_mul(rows,width);
++    const auto input=rows ? checked_add(1,checked_add(checked_mul(rows-1,stride0),checked_mul(2,stride1))) : 0;
++    const auto grid=rows ? checked_mul(checked_mul(1+(rows-1)/16,3),1+(dim-1)/16) : 0;
++    if (grid>INT32_MAX) throw std::invalid_argument("NineToothed H3 rotary grid exceeds signed 31-bit x dimension");
++    return {static_cast<int64_t>(rows),static_cast<int64_t>(dim),stride0,stride1,input,output,static_cast<unsigned>(grid)};
++}
++struct LaunchArguments {
++    std::array<void *,3> data;
++    std::array<int64_t,18> scalars{};
++    std::array<float,2> config;
++    void *scratch=nullptr,*profile=nullptr;
++    std::array<void *,25> arguments{};
++    LaunchArguments(const Layout &layout,void *positions,void *output,size_t output_bytes,float theta)
++        : data{output,static_cast<void *>(static_cast<char *>(output)+checked_mul(checked_mul(3,layout.dim),output_bytes)),positions},
++          config{theta,static_cast<float>(layout.dim)} {
++        for (int tensor=0;tensor<3;++tensor) {
++            const int offset=tensor*6,base=tensor*7;
++            scalars[offset]=layout.rows; scalars[offset+1]=3; scalars[offset+2]=layout.dim;
++            scalars[offset+3]=tensor==2 ? layout.stride0 : 6*layout.dim;
++            scalars[offset+4]=tensor==2 ? layout.stride1 : layout.dim;
++            scalars[offset+5]=tensor==2 ? 0 : 1;
++            arguments[base]=&data[tensor];
++            for (int i=0;i<6;++i) arguments[base+1+i]=&scalars[offset+i];
++        }
++        // NineToothed 0.26 sorts scalar symbol names: tensor_10 (dimension)
++        // precedes tensor_9 (theta). Verified against the generated launcher.
++        arguments[21]=&config[1]; arguments[22]=&config[0]; arguments[23]=&scratch; arguments[24]=&profile;
++    }
++    LaunchArguments(const LaunchArguments &)=delete;
++    LaunchArguments &operator=(const LaunchArguments &)=delete;
++};
++} // namespace infinicore::op::h3_rotary_cache_impl::ninetoothed
+--- a/InfiniCore/src/infinicore/ops/mrope/mrope.cc
++++ b/InfiniCore/src/infinicore/ops/mrope/mrope.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/mrope.hpp"
+ #include "../../utils.hpp"
++#include "ninetoothed/mrope_ninetoothed.hpp"
+ 
+ namespace infinicore::op {
+ 
+@@ -77,6 +78,13 @@
+             int section_h,
+             int section_w,
+             bool interleaved) {
++    if(!q_out || !k_out || !q || !k || !cos || !sin || !positions)
++        throw std::invalid_argument("mrope requires non-null tensors");
++    if(q->device().getType()==Device::Type::HYGON && mrope_impl::ninetoothed::enabled()) {
++        mrope_impl::ninetoothed::execute(q_out,k_out,q,k,cos,sin,positions,
++                                       head_size,rotary_dim,section_t,section_h,section_w,interleaved);
++        return;
++    }
+     MRoPE::execute(q_out, k_out, q, k, cos, sin, positions, head_size, rotary_dim, section_t, section_h, section_w, interleaved);
+ }
+ 
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/mrope/ninetoothed/mrope_layout.hpp
+@@ -0,0 +1,114 @@
++#pragma once
++// Host metadata and ABI only. Device indexing and arithmetic are NineToothed.
++#include <array>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace infinicore::op::mrope_impl::ninetoothed {
++inline uint64_t add(uint64_t a,uint64_t b) {
++    if(b>uint64_t(INT64_MAX) || a>uint64_t(INT64_MAX)-b) throw std::invalid_argument("MRoPE metadata exceeds int64");
++    return a+b;
++}
++inline uint64_t mul(uint64_t a,uint64_t b) {
++    if(b && a>uint64_t(INT64_MAX)/b) throw std::invalid_argument("MRoPE metadata exceeds int64");
++    return a*b;
++}
++struct Meta {
++    std::vector<int64_t> shape,strides;
++};
++inline uint64_t span(const Meta &m) {
++    if(m.shape.size()!=m.strides.size()) throw std::invalid_argument("MRoPE metadata rank mismatch");
++    bool empty=false;
++    for(size_t i=0;i<m.shape.size();++i) {
++        if(m.shape[i]<0 || m.strides[i]<0) throw std::invalid_argument("MRoPE requires nonnegative int64 metadata");
++        empty=empty || m.shape[i]==0;
++    }
++    if(empty) return 0;
++    uint64_t last=0;
++    for(size_t i=0;i<m.shape.size();++i) last=add(last,mul(m.shape[i]-1,m.strides[i]));
++    return add(last,1);
++}
++struct Layout {
++    std::array<Meta,7> original;
++    std::array<Meta,7> views;
++    std::array<uint64_t,7> spans{};
++    std::array<uint32_t,2> grids{};
++    // half, section_t, section_h, section_w, interleaved, table_rows
++    std::array<int64_t,6> scalars{};
++};
++inline Layout prepare_layout(const std::array<Meta,7> &m,const std::array<int64_t,6> &p) {
++    Layout result; result.original=m;
++    const auto head=p[0],rotary=p[1];
++    if(head<=0 || rotary<=0 || rotary>head || rotary%2 || p[2]<=0 || p[3]<=0 || p[4]<=0 || (p[5]!=0 && p[5]!=1))
++        throw std::invalid_argument("MRoPE head/rotary/section/interleaved parameters invalid");
++    if(add(add(p[2],p[3]),p[4])!=uint64_t(rotary/2)) throw std::invalid_argument("MRoPE sections must sum to rotary_dim/2");
++    for(size_t i=0;i<7;++i) {
++        result.spans[i]=span(m[i]);
++        if((i<6 && m[i].shape.size()!=2) || (i==6 && m[i].shape.size()!=1 && m[i].shape.size()!=2))
++            throw std::invalid_argument("MRoPE expects matrix data and one- or two-axis position metadata");
++    }
++    const int64_t rows=m[2].shape[0];
++    for(size_t i=0;i<4;++i) {
++        const int64_t width=m[i].shape[1];
++        if(m[i].shape[0]!=rows || width<=0 || width%head || m[i].strides[1]!=1)
++            throw std::invalid_argument("MRoPE Q/K shape or last stride invalid");
++        if(i<2 && rows>1 && m[i].strides[0]<width) throw std::invalid_argument("MRoPE output rows overlap");
++        result.views[i]=Meta{{rows,width/head,head},{m[i].strides[0],head,1}};
++    }
++    if(m[0].shape!=m[2].shape || m[1].shape!=m[3].shape) throw std::invalid_argument("MRoPE output shapes differ from inputs");
++    if(m[4].shape!=m[5].shape || m[4].shape[1]!=rotary/2 || (rows && !m[4].shape[0]) || m[4].strides[1]!=1 || m[5].strides[1]!=1)
++        throw std::invalid_argument("MRoPE cache shape or last stride invalid");
++    result.views[4]=m[4]; result.views[5]=m[5];
++    if(m[6].shape.size()==1) {
++        if(m[6].shape[0]!=rows) throw std::invalid_argument("MRoPE position sequence length invalid");
++        result.views[6]=Meta{{3,rows},{0,m[6].strides[0]}};
++    } else {
++        if(m[6].shape[0]!=3 || m[6].shape[1]!=rows) throw std::invalid_argument("MRoPE axes positions must be [3,S]");
++        result.views[6]=m[6];
++    }
++    result.scalars={rotary/2,p[2],p[3],p[4],p[5],m[4].shape[0]};
++    for(size_t i=0;i<2;++i) {
++        const uint64_t grid=mul(mul(rows,result.views[i].shape[1]),1+(uint64_t(head)-1)/128);
++        if(grid>INT32_MAX) throw std::invalid_argument("MRoPE grid exceeds supported x dimension");
++        result.grids[i]=static_cast<uint32_t>(grid);
++    }
++    return result;
++}
++inline bool overlaps(uintptr_t a,uint64_t aspan,size_t abytes,uintptr_t b,uint64_t bspan,size_t bbytes) {
++    const auto x=mul(aspan,abytes),y=mul(bspan,bbytes);
++    if(x>UINTPTR_MAX-a || y>UINTPTR_MAX-b) throw std::invalid_argument("MRoPE address range overflow");
++    return x && y && a<b+y && b<a+x;
++}
++inline void validate_alias(const Layout &layout,const std::array<void *,7> &pointers,size_t data_bytes,size_t position_bytes) {
++    for(size_t output=0;output<2;++output) for(size_t other=output+1;other<7;++other) {
++        if(overlaps(reinterpret_cast<uintptr_t>(pointers[output]),layout.spans[output],data_bytes,
++                    reinterpret_cast<uintptr_t>(pointers[other]),layout.spans[other],other==6?position_bytes:data_bytes))
++            throw std::invalid_argument("NineToothed MRoPE rejects overlapping output/input spans");
++    }
++}
++struct LaunchArguments {
++    std::array<void *,5> data{};
++    std::array<int64_t,30> values{};
++    std::array<void *,37> arguments{};
++    void *global_scratch=nullptr,*profile_scratch=nullptr;
++    LaunchArguments(const Layout &layout,const std::array<void *,7> &pointers,int which) {
++        if(which<0 || which>1) throw std::invalid_argument("Invalid Q/K selector");
++        const std::array<int,5> tensors{which,which+2,4,5,6};
++        size_t cursor=0,scalar=0;
++        // NineToothed sorts scalar names before prefixed tensor names.
++        for(auto v:layout.scalars) { values[scalar]=v; arguments[cursor++]=&values[scalar++]; }
++        for(size_t i=0;i<5;++i) {
++            const auto &m=layout.views[tensors[i]];
++            data[i]=pointers[tensors[i]]; arguments[cursor++]=&data[i];
++            for(auto v:m.shape) { values[scalar]=v; arguments[cursor++]=&values[scalar++]; }
++            for(auto v:m.strides) { values[scalar]=v; arguments[cursor++]=&values[scalar++]; }
++        }
++        if(cursor!=35 || scalar!=30) throw std::logic_error("MRoPE host ABI count mismatch");
++        arguments[35]=&global_scratch; arguments[36]=&profile_scratch;
++    }
++    LaunchArguments(const LaunchArguments &)=delete;
++    LaunchArguments &operator=(const LaunchArguments &)=delete;
++};
++} // namespace infinicore::op::mrope_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/mrope/ninetoothed/mrope_ninetoothed.cc
+@@ -0,0 +1,87 @@
++#include "mrope_ninetoothed.hpp"
++#include "mrope_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++namespace infinicore::op::mrope_impl::ninetoothed {
++namespace {
++using Launch=int(*)(const char *,unsigned,void *,void **);
++using Error=const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex; static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    const auto found=cache.find(root); if(found!=cache.end()) return found->second;
++    auto handle=dlopen((root+"/libminimax_nine_mrope_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!handle) throw std::runtime_error(std::string("MRoPE host load failed: ")+dlerror());
++    auto launch=reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_mrope_launch"));
++    auto error=reinterpret_cast<Error>(dlsym(handle,"minimax_nine_mrope_error"));
++    if(!launch || !error) { dlclose(handle); throw std::runtime_error("MRoPE host ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root; throw std::runtime_error("Precompiled MRoPE requires Linux");
++#endif
++}
++const char *data_name(DataType t) {
++    switch(t) {
++    case DataType::F16:return "f16"; case DataType::BF16:return "bf16"; case DataType::F32:return "f32";
++    default:throw std::invalid_argument("NineToothed MRoPE supports F16/BF16/F32; no numerical fallback");
++    }
++}
++class MRoPEOperator final : public graph::GraphOperator {
++    std::array<graph::GraphTensor,7> tensors_;
++    Layout layout_;
++    std::string root_,binary_;
++public:
++    MRoPEOperator(Tensor qo,Tensor ko,const Tensor &q,const Tensor &k,const Tensor &cos,const Tensor &sin,const Tensor &pos,
++                 const std::array<int64_t,6> &params,std::string root)
++        : tensors_{graph::GraphTensor(qo),graph::GraphTensor(ko),graph::GraphTensor(q),graph::GraphTensor(k),graph::GraphTensor(cos),graph::GraphTensor(sin),graph::GraphTensor(pos)},root_(std::move(root)) {
++        const std::array<Tensor,7> all{qo,ko,q,k,cos,sin,pos}; std::array<Meta,7> metadata;
++        const std::string name=data_name(q->dtype());
++        for(size_t i=0;i<7;++i) {
++            if(all[i]->device()!=q->device()) throw std::invalid_argument("MRoPE requires the same device");
++            if(i<6 && all[i]->dtype()!=q->dtype()) throw std::invalid_argument("MRoPE data dtypes differ");
++            for(auto d:all[i]->shape()) {
++                if(d>uint64_t(INT64_MAX)) throw std::invalid_argument("MRoPE size exceeds int64");
++                metadata[i].shape.push_back(static_cast<int64_t>(d));
++            }
++            for(auto s:all[i]->strides()) metadata[i].strides.push_back(s);
++        }
++        if(pos->dtype()!=DataType::I32 && pos->dtype()!=DataType::I64) throw std::invalid_argument("MRoPE positions must be I32/I64");
++        layout_=prepare_layout(metadata,params);
++        binary_=root_+"/kernels/"+name+(pos->dtype()==DataType::I32?"_i32":"_i64")+"/kernel.hsaco";
++    }
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if(!layout_.grids[0] && !layout_.grids[1]) return;
++        std::array<void *,7> pointers;
++        for(size_t i=0;i<7;++i) { auto tensor=tensors_[i]; pointers[i]=tensor->data(); }
++        validate_alias(layout_,pointers,tensors_[0]->element_size(),tensors_[6]->element_size());
++        const auto device=tensors_[0]->device();
++        if(context::getDevice()!=device) context::setDevice(device);
++        auto &host=runtime(root_);
++        for(int which=0;which<2;++which) {
++            LaunchArguments args(layout_,pointers,which);
++            if(host.launch(binary_.c_str(),layout_.grids[which],context::getStream(),args.arguments.data()))
++                throw std::runtime_error(std::string("NineToothed MRoPE launch failed: ")+host.error());
++        }
++    }
++};
++}
++bool enabled() { const auto root=std::getenv("INFINICORE_NINETOOTHED_MROPE_ROOT"); return root && root[0]; }
++void execute(Tensor qo,Tensor ko,const Tensor &q,const Tensor &k,const Tensor &cos,const Tensor &sin,const Tensor &pos,
++             int head,int rotary,int t,int h,int w,bool interleaved) {
++    const auto root=std::getenv("INFINICORE_NINETOOTHED_MROPE_ROOT");
++    if(!root || !root[0]) throw std::runtime_error("NineToothed MRoPE root missing");
++    auto op=std::make_shared<MRoPEOperator>(qo,ko,q,k,cos,sin,pos,std::array<int64_t,6>{head,rotary,t,h,w,interleaved},root);
++    if(context::isGraphRecording()) context::addGraphOperator(op); else op->run();
++}
++} // namespace infinicore::op::mrope_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/mrope/ninetoothed/mrope_ninetoothed.hpp
+@@ -0,0 +1,7 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++namespace infinicore::op::mrope_impl::ninetoothed {
++bool enabled();
++void execute(Tensor q_out,Tensor k_out,const Tensor &q,const Tensor &k,const Tensor &cos,const Tensor &sin,const Tensor &positions,
++             int head_size,int rotary_dim,int section_t,int section_h,int section_w,bool interleaved);
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/multi_head_attention/hygon/kernel_metadata.hpp
+@@ -0,0 +1,3 @@
++#pragma once
++#include <stdexcept>
++namespace minimax_nine_mha { inline unsigned shared_bytes(unsigned tile,int dtype) { const unsigned values[2][3]={{16384,8192,8192},{32768,16384,16384}};if((tile!=64&&tile!=128)||dtype<0||dtype>2)throw std::invalid_argument("MHA kernel metadata");return values[tile==128][dtype];} }
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/multi_head_attention/hygon/mha_layout.hpp
+@@ -0,0 +1,80 @@
++#pragma once
++// Host metadata and ABI only. Attention arithmetic is NineToothed-generated.
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <utility>
++#include <vector>
++
++namespace minimax_nine_mha {
++using Matrix=std::array<std::array<int64_t,4>,4>;
++inline uint64_t add(uint64_t a,uint64_t b) {
++    if(b>uint64_t(INT64_MAX)||a>uint64_t(INT64_MAX)-b) throw std::invalid_argument("MHA metadata overflow");
++    return a+b;
++}
++inline uint64_t mul(uint64_t a,uint64_t b) {
++    if(b && a>uint64_t(INT64_MAX)/b) throw std::invalid_argument("MHA metadata overflow");
++    return a*b;
++}
++struct Layout {
++    Matrix shapes{},strides{}; // Four tensors ordered output,Q,K,V; BHND views.
++    std::array<uint64_t,4> spans{};
++    uint32_t grid=0,tile=64;
++    int64_t batch=0,nq=0,nk=0,hq=0,hk=0,dim=0;
++};
++inline Layout layout(const Matrix &shapes,const Matrix &strides) {
++    Layout p;
++    for(int t=0;t<4;++t) for(int d=0;d<4;++d) {
++        if(shapes[t][d]<0 || shapes[t][d]>INT32_MAX || strides[t][d]<0) throw std::invalid_argument("MHA requires nonnegative bounded metadata");
++    }
++    p.batch=shapes[1][0];p.nq=shapes[1][1];p.hq=shapes[1][2];p.dim=shapes[1][3];p.nk=shapes[2][1];p.hk=shapes[2][2];
++    if(shapes[0]!=shapes[1] || shapes[2]!=shapes[3] || shapes[2][0]!=p.batch || shapes[2][3]!=p.dim || p.hq<=0 || p.hk<=0 || p.hq%p.hk || p.dim<=0 || p.dim>128 || (p.batch && p.nq && !p.nk))
++        throw std::invalid_argument("Unsupported MHA B,N,H,D or grouped-query geometry");
++    const int order[4]={0,2,1,3};
++    for(int t=0;t<4;++t) {
++        bool empty=false;uint64_t last=0;
++        for(int d=0;d<4;++d) {empty|=!shapes[t][d];if(shapes[t][d])last=add(last,mul(shapes[t][d]-1,strides[t][d]));}
++        p.spans[t]=empty?0:add(last,1);
++        for(int d=0;d<4;++d) {p.shapes[t][d]=shapes[t][order[d]];p.strides[t][d]=strides[t][order[d]];}
++    }
++    if(p.spans[0]) {
++        std::vector<std::pair<uint64_t,uint64_t>> axes;
++        for(int d=0;d<4;++d) if(shapes[0][d]>1)axes.emplace_back(strides[0][d],shapes[0][d]);
++        std::sort(axes.begin(),axes.end());uint64_t covered=1;
++        for(auto axis:axes) {if(axis.first<covered)throw std::invalid_argument("MHA output may overlap");covered=add(covered,mul(axis.second-1,axis.first));}
++    }
++    auto grid=mul(mul(p.batch,p.hq),(p.nq+15)/16);
++    if(grid>UINT32_MAX/256)throw std::invalid_argument("MHA launch grid overflow");
++    p.grid=static_cast<uint32_t>(grid);p.tile=p.dim<=64?64:128;return p;
++}
++inline void reject_alias(const Layout &p,const std::array<void *,4> &data,uint64_t bytes) {
++    const auto out=reinterpret_cast<uintptr_t>(data[0]);const auto outbytes=mul(p.spans[0],bytes);
++    if(outbytes>UINTPTR_MAX-out)throw std::invalid_argument("MHA output address overflow");
++    for(int t=1;t<4;++t) {
++        const auto ptr=reinterpret_cast<uintptr_t>(data[t]);const auto count=mul(p.spans[t],bytes);
++        if(count>UINTPTR_MAX-ptr)throw std::invalid_argument("MHA input address overflow");
++        if(outbytes && count && out<ptr+count && ptr<out+outbytes)throw std::invalid_argument("MHA output/input alias rejected");
++    }
++}
++struct Arguments {
++    float scale;
++    std::array<int64_t,4> scalar;
++    std::array<void *,4> data;
++    std::array<int64_t,32> meta{};
++    std::array<void *,43> values{};
++    void *global_scratch=nullptr,*profile_scratch=nullptr;
++    Arguments(const Layout &p,std::array<void *,4> ptr,float s,bool causal):scale(s),scalar{p.nk,p.nq,p.hq/p.hk,int64_t(causal)},data(ptr) {
++        if(!std::isfinite(scale))throw std::invalid_argument("MHA scale must be finite");
++        values[0]=&scale;for(int i=0;i<4;++i)values[i+1]=&scalar[i];
++        for(int t=0;t<4;++t) {
++            const int base=5+9*t;values[base]=&data[t];
++            for(int d=0;d<4;++d) {meta[8*t+d]=p.shapes[t][d];meta[8*t+4+d]=p.strides[t][d];values[base+1+d]=&meta[8*t+d];values[base+5+d]=&meta[8*t+4+d];}
++        }
++        values[41]=&global_scratch;values[42]=&profile_scratch;
++    }
++    Arguments(const Arguments &)=delete;
++};
++} // namespace minimax_nine_mha
+--- a/InfiniCore/src/infinicore/ops/multi_head_attention/hygon/mha_native_hygon.cc
++++ b/InfiniCore/src/infinicore/ops/multi_head_attention/hygon/mha_native_hygon.cc
+@@ -1,109 +1,76 @@
+ #ifdef ENABLE_HYGON_API
+-
+-#include "infinicore/ops/mha.hpp"
+-#include "infinicore/context/context.hpp"
+-#include "mha_native_hygon.hpp"
+-
+-#include <limits>
+-#include <stdexcept>
++// Registered real InfiniCore MHA. No legacy numerical fallback.
++#include <infinicore/ops/mha.hpp>
++#include <infinicore/context/context.hpp>
++#include "mha_layout.hpp"
++#include "kernel_metadata.hpp"
++#include <cstdlib>
++#include <dlfcn.h>
++#include <mutex>
+ #include <string>
++#include <unordered_map>
+ 
+ namespace infinicore::op::mha_impl::hygon {
+ namespace {
+-
+-struct PlannedMeta {
+-    graph::GraphTensor out, q, k, v;
+-    MhaParams params;
+-    int dtype;
++using Launch=int(*)(const char *,unsigned,unsigned,unsigned,int,const int64_t *,void *,void **);
++using Error=const char *(*)();
++struct Runtime {void *handle;Launch launch;Error error;};
++Runtime &runtime(const std::string &root) {
++    static std::mutex mutex;static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> guard(mutex);auto it=cache.find(root);if(it!=cache.end())return it->second;
++    auto lib=dlopen((root+"/libminimax_nine_mha_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!lib)throw std::runtime_error(std::string("Nine MHA host load failed: ")+dlerror());
++    auto fn=reinterpret_cast<Launch>(dlsym(lib,"minimax_nine_mha_launch"));auto error=reinterpret_cast<Error>(dlsym(lib,"minimax_nine_mha_error"));
++    if(!fn||!error){dlclose(lib);throw std::runtime_error("Nine MHA host ABI mismatch");}
++    return cache.emplace(root,Runtime{lib,fn,error}).first->second;
++}
++struct Planned {
++    graph::GraphTensor out,q,k,v;
++    minimax_nine_mha::Layout layout;
++    float scale;bool causal;int dtype;std::string root;
+ };
+-
+-void check_input(const Tensor &out, const Tensor &q, const Tensor &k,
+-                 const Tensor &v, const std::optional<Tensor> &alibi_slopes) {
+-    if (alibi_slopes.has_value()) {
+-        throw std::runtime_error("Hygon native MHA does not support ALiBi slopes");
++void *plan(Tensor out,const Tensor &q,const Tensor &k,const Tensor &v,std::optional<Tensor> alibi,float scale,bool causal) {
++    if(alibi.has_value())throw std::invalid_argument("Nine MHA does not support ALiBi; no fallback");
++    minimax_nine_mha::Matrix shapes{},strides{};std::array<Tensor,4> tensors{out,q,k,v};
++    for(int t=0;t<4;++t) {
++        auto a=tensors[t];
++        if(!a||a->ndim()!=4||a->device()!=out->device()||a->dtype()!=out->dtype())throw std::invalid_argument("Nine MHA requires equal types/devices and rank four");
++        for(int d=0;d<4;++d){shapes[t][d]=a->size(d);strides[t][d]=a->stride(d);}
+     }
+-    if (q->ndim() != 4 || k->ndim() != 4 || v->ndim() != 4 || out->ndim() != 4) {
+-        throw std::runtime_error("Hygon native MHA expects [batch, sequence, heads, dim]");
+-    }
+-    if (q->dtype() != k->dtype() || q->dtype() != v->dtype()
+-        || q->dtype() != out->dtype()) {
+-        throw std::runtime_error("Hygon native MHA requires identical input/output dtypes");
+-    }
+-    if (q->dtype() != DataType::F16 && q->dtype() != DataType::BF16
+-        && q->dtype() != DataType::F32) {
+-        throw std::runtime_error("Hygon native MHA supports FP16, BF16 and FP32");
+-    }
+-    if (q->shape() != out->shape() || q->size(0) != k->size(0)
+-        || k->size(0) != v->size(0) || k->size(1) != v->size(1)
+-        || k->size(2) != v->size(2) || q->size(3) != k->size(3)
+-        || q->size(3) != v->size(3) || k->size(1) == 0
+-        || k->size(2) == 0 || q->size(2) == 0
+-        || q->size(2) % k->size(2) != 0) {
+-        throw std::runtime_error("Hygon native MHA has incompatible Q/K/V shapes");
+-    }
+-    if (q->size(3) == 0 || q->size(3) > 256) {
+-        throw std::runtime_error("Hygon native MHA supports head dimensions 1..256");
+-    }
+-    constexpr auto grid_limit = std::numeric_limits<unsigned int>::max();
+-    if (q->size(0) > grid_limit || q->size(1) > grid_limit
+-        || q->size(2) > grid_limit) {
+-        throw std::runtime_error("Hygon native MHA grid dimensions are too large");
+-    }
++    int dtype=-1;
++    switch(q->dtype()){case DataType::F32:dtype=0;break;case DataType::F16:dtype=1;break;case DataType::BF16:dtype=2;break;default:throw std::invalid_argument("Nine MHA requires F32/F16/BF16");}
++    if(!std::isfinite(scale))throw std::invalid_argument("Nine MHA scale must be finite");
++    const char *root=std::getenv("INFINICORE_NINETOOTHED_MHA_ROOT");
++    if(!root||!root[0])throw std::runtime_error("Nine MHA root required; handwritten legacy MHA disabled");
++    return new Planned{graph::GraphTensor(out),graph::GraphTensor(q),graph::GraphTensor(k),graph::GraphTensor(v),minimax_nine_mha::layout(shapes,strides),scale,causal,dtype,root};
+ }
+-
+-MhaParams make_params(const Tensor &out, const Tensor &q, const Tensor &k,
+-                      const Tensor &v, float scale, bool is_causal) {
+-    MhaParams params{};
+-    params.batch = static_cast<int64_t>(q->size(0));
+-    params.query_length = static_cast<int64_t>(q->size(1));
+-    params.key_length = static_cast<int64_t>(k->size(1));
+-    params.query_heads = static_cast<int64_t>(q->size(2));
+-    params.kv_heads = static_cast<int64_t>(k->size(2));
+-    params.head_dim = static_cast<int64_t>(q->size(3));
+-    for (size_t i = 0; i < 4; ++i) {
+-        params.out_strides[i] = static_cast<int64_t>(out->stride(i));
+-        params.q_strides[i] = static_cast<int64_t>(q->stride(i));
+-        params.k_strides[i] = static_cast<int64_t>(k->stride(i));
+-        params.v_strides[i] = static_cast<int64_t>(v->stride(i));
+-    }
+-    params.scale = scale;
+-    params.causal = is_causal;
+-    return params;
++void run(void *opaque) {
++    auto &p=*static_cast<Planned *>(opaque);if(!p.layout.grid)return;
++    std::array<void *,4> data{p.out->data(),p.q->data(),p.k->data(),p.v->data()};
++    minimax_nine_mha::reject_alias(p.layout,data,p.dtype==0?4:2);
++    if(context::getDevice()!=p.out->device())context::setDevice(p.out->device());
++    minimax_nine_mha::Arguments args(p.layout,data,p.scale,p.causal);
++    const std::array<const char *,3> names{"f32","f16","bf16"};
++    auto binary=p.root+"/tile"+std::to_string(p.layout.tile)+"/kernels/"+names[p.dtype]+"/kernel.hsaco";
++    int64_t meta[11]={p.layout.batch,p.layout.nq,p.layout.nk,p.layout.hq,p.layout.hk,p.layout.dim,int64_t(p.causal),p.layout.strides[1][2],p.layout.strides[2][2],p.layout.strides[3][2],p.layout.strides[0][2]};
++    auto &host=runtime(p.root);const auto shared=minimax_nine_mha::shared_bytes(p.layout.tile,p.dtype);
++    if(host.launch(binary.c_str(),p.layout.grid,shared,p.layout.tile,p.dtype,meta,context::getStream(),args.values.data()))throw std::runtime_error(std::string("Nine MHA launch failed: ")+host.error());
+ }
+-
+-void *plan(Tensor out, const Tensor &q, const Tensor &k, const Tensor &v,
+-           std::optional<Tensor> alibi_slopes, float scale, bool is_causal) {
+-    check_input(out, q, k, v, alibi_slopes);
+-    return new PlannedMeta{graph::GraphTensor(out), graph::GraphTensor(q),
+-                           graph::GraphTensor(k), graph::GraphTensor(v),
+-                           make_params(out, q, k, v, scale, is_causal),
+-                           static_cast<int>(q->dtype())};
++void cleanup(void **p){delete static_cast<Planned *>(*p);*p=nullptr;}
++const bool registered=[](){MultiheadAttention::plan_dispatcher().registerDevice(Device::Type::HYGON,&plan);MultiheadAttention::run_dispatcher().registerDevice(Device::Type::HYGON,&run);MultiheadAttention::cleanup_dispatcher().registerDevice(Device::Type::HYGON,&cleanup);return true;}();
++class NineOperator final:public graph::GraphOperator {
++    void *planned_;
++public:
++    NineOperator(Tensor out,const Tensor &q,const Tensor &k,const Tensor &v,std::optional<Tensor> alibi,float scale,bool causal)
++        :planned_(plan(out,q,k,v,alibi,scale,causal)){}
++    ~NineOperator() override{cleanup(&planned_);}
++    bool is_device_graph_capture_safe()const override{return false;}
++    void run()const override{hygon::run(planned_);}
++};
++} // namespace
++void execute_ninetoothed(Tensor out,const Tensor &q,const Tensor &k,const Tensor &v,std::optional<Tensor> alibi,float scale,bool causal){
++    auto op=std::make_shared<NineOperator>(out,q,k,v,alibi,scale,causal);
++    if(context::isGraphRecording())context::addGraphOperator(op);else op->run();
+ }
+-
+-void run(void *planned_meta) {
+-    auto *p = static_cast<PlannedMeta *>(planned_meta);
+-    const int status = launch_mha(p->q->data(), p->k->data(), p->v->data(),
+-                                  p->out->data(), p->params, p->dtype,
+-                                  context::getStream());
+-    if (status != 0) {
+-        throw std::runtime_error("Hygon native MHA kernel launch failed (CUDA/HIP status "
+-                                 + std::to_string(status) + ")");
+-    }
+-}
+-
+-void cleanup(void **planned_meta_ptr) {
+-    delete *reinterpret_cast<PlannedMeta **>(planned_meta_ptr);
+-    *planned_meta_ptr = nullptr;
+-}
+-
+-const bool registered = []() {
+-    MultiheadAttention::plan_dispatcher().registerDevice(Device::Type::HYGON, &plan);
+-    MultiheadAttention::run_dispatcher().registerDevice(Device::Type::HYGON, &run);
+-    MultiheadAttention::cleanup_dispatcher().registerDevice(Device::Type::HYGON, &cleanup);
+-    return true;
+-}();
+-
+-} // namespace
+ } // namespace infinicore::op::mha_impl::hygon
+-
+-#endif // ENABLE_HYGON_API
++#endif
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/multi_head_attention/hygon/mha_ninetoothed.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++#include <optional>
++namespace infinicore::op::mha_impl::hygon {
++void execute_ninetoothed(Tensor out,const Tensor &q,const Tensor &k,const Tensor &v,std::optional<Tensor> alibi,float scale,bool causal);
++}
+--- a/InfiniCore/src/infinicore/ops/multi_head_attention/mha.cc
++++ b/InfiniCore/src/infinicore/ops/multi_head_attention/mha.cc
+@@ -1,5 +1,8 @@
+ #include "infinicore/ops/mha.hpp"
+ #include "../../utils.hpp"
++#ifdef ENABLE_HYGON_API
++#include "hygon/mha_ninetoothed.hpp"
++#endif
+ 
+ namespace infinicore::op {
+ 
+@@ -48,6 +51,9 @@
+           std::optional<Tensor> alibi_slopes,
+           float scale,
+           bool is_causal) {
++#ifdef ENABLE_HYGON_API
++    if(q && q->device().getType()==Device::Type::HYGON){mha_impl::hygon::execute_ninetoothed(out,q,k,v,alibi_slopes,scale,is_causal);return;}
++#endif
+     MultiheadAttention::execute(out, q, k, v, alibi_slopes, scale, is_causal);
+ }
+ 
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/rms_norm/ninetoothed/rms_norm_layout.hpp
+@@ -0,0 +1,63 @@
++#pragma once
++// Metadata only; the reduction and output arithmetic are NineToothed code.
++#include "../../cast/ninetoothed/cast_layout.hpp"
++#include <cmath>
++namespace infinicore::op::rms_norm_impl::ninetoothed {
++using cast_impl::ninetoothed::checked_add;
++using cast_impl::ninetoothed::checked_mul;
++using cast_impl::ninetoothed::byte_ranges_overlap;
++struct Layout {
++    std::array<int64_t,3> shape{1,1,1},input{},output{};
++    uint64_t rows=0,elements=0,input_span=0,output_span=0;
++    int tile=128;
++    unsigned shared=8;
++};
++inline Layout normalize_layout(const std::vector<size_t> &shape,const std::vector<ptrdiff_t> &input,const std::vector<ptrdiff_t> &output,size_t weights,ptrdiff_t weight_stride) {
++    if((shape.size()!=2 && shape.size()!=3) || shape.size()!=input.size() || shape.size()!=output.size())
++        throw std::invalid_argument("NineToothed RMSNorm requires rank 2 or 3");
++    const size_t width=shape.back();
++    if(!width || width>8192 || weights!=width || weight_stride!=1 || input.back()!=1 || output.back()!=1)
++        throw std::invalid_argument("RMSNorm requires width 1..8192, matching contiguous weight and last dimension");
++    for(size_t i=0;i<shape.size();++i)
++        if(shape[i]>uint64_t(INT64_MAX) || input[i]<0 || output[i]<0) throw std::invalid_argument("RMSNorm requires nonnegative int64 metadata");
++    Layout result; result.tile=width<=128?128:width<=1024?1024:8192; result.shared=result.tile==128?8:16;
++    if(shape.size()==2) { result.shape={int64_t(shape[0]),1,int64_t(width)}; result.input={input[0],0,1}; result.output={output[0],0,1}; }
++    else for(size_t i=0;i<3;++i) { result.shape[i]=shape[i]; result.input[i]=input[i]; result.output[i]=output[i]; }
++    result.rows=checked_mul(result.shape[0],result.shape[1]); result.elements=checked_mul(result.rows,width);
++    if(result.rows>INT32_MAX) throw std::invalid_argument("RMSNorm grid exceeds supported x dimension");
++    if(!result.rows) return result;
++    uint64_t il=0,ol=0; std::vector<std::pair<uint64_t,uint64_t>> axes;
++    for(size_t i=0;i<3;++i) {
++        il=checked_add(il,checked_mul(result.shape[i]-1,result.input[i]));
++        ol=checked_add(ol,checked_mul(result.shape[i]-1,result.output[i]));
++        if(result.shape[i]>1) axes.emplace_back(result.output[i],result.shape[i]);
++    }
++    std::sort(axes.begin(),axes.end()); uint64_t covered=1;
++    for(const auto &axis:axes) {
++        if(axis.first<covered) throw std::invalid_argument("RMSNorm output may overlap");
++        covered=checked_add(covered,checked_mul(axis.second-1,axis.first));
++    }
++    result.input_span=checked_add(il,1); result.output_span=checked_add(ol,1); return result;
++}
++struct LaunchArguments {
++    float epsilon;
++    std::array<void *,3> data;
++    std::array<int64_t,19> scalars{};
++    std::array<void *,25> arguments{};
++    void *global_scratch=nullptr,*profile_scratch=nullptr;
++    LaunchArguments(const Layout &layout,void *input,void *weight,void *output,float eps):epsilon(eps),data{input,weight,output} {
++        scalars[0]=layout.shape[2]; arguments[0]=&epsilon; arguments[1]=&scalars[0];
++        for(int tensor=0;tensor<3;++tensor) {
++            const int base=2+7*tensor; arguments[base]=&data[tensor];
++            for(int d=0;d<3;++d) {
++                scalars[1+6*tensor+d]=layout.shape[d];
++                scalars[1+6*tensor+3+d]=tensor==0?layout.input[d]:tensor==2?layout.output[d]:d==2?1:0;
++                arguments[base+1+d]=&scalars[1+6*tensor+d]; arguments[base+4+d]=&scalars[1+6*tensor+3+d];
++            }
++        }
++        arguments[23]=&global_scratch; arguments[24]=&profile_scratch;
++    }
++    LaunchArguments(const LaunchArguments &)=delete;
++    LaunchArguments &operator=(const LaunchArguments &)=delete;
++};
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/rms_norm/ninetoothed/rms_norm_ninetoothed.cc
+@@ -0,0 +1,72 @@
++#include "rms_norm_ninetoothed.hpp"
++#include "rms_norm_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++namespace infinicore::op::rms_norm_impl::ninetoothed {
++namespace {
++using Launch=int(*)(const char *,int,unsigned,unsigned,void *,void **);
++using Error=const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex; static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex); auto found=cache.find(root); if(found!=cache.end()) return found->second;
++    auto handle=dlopen((root+"/libminimax_nine_rms_norm_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!handle) throw std::runtime_error(std::string("RMSNorm host load failed: ")+dlerror());
++    auto launch=reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_rms_norm_launch"));
++    auto error=reinterpret_cast<Error>(dlsym(handle,"minimax_nine_rms_norm_error"));
++    if(!launch || !error) { dlclose(handle); throw std::runtime_error("RMSNorm host ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root; throw std::runtime_error("Precompiled NineToothed RMSNorm requires Linux");
++#endif
++}
++const char *dtype_name(DataType type) {
++    switch(type) { case DataType::F32:return "f32"; case DataType::F16:return "f16"; case DataType::BF16:return "bf16";
++    default:throw std::invalid_argument("RMSNorm supports F32/F16/BF16; no numerical fallback"); }
++}
++class Operator final:public graph::GraphOperator {
++    graph::GraphTensor output_,input_,weight_;
++    Layout layout_;
++    float epsilon_;
++    std::string root_,binary_;
++public:
++    Operator(Tensor output,const Tensor &input,const Tensor &weight,float epsilon,std::string root)
++        :output_(output),input_(input),weight_(weight),layout_(normalize_layout(input->shape(),input->strides(),output->strides(),weight->numel(),weight->strides().back())),epsilon_(epsilon),root_(std::move(root)) {
++        const std::string data=dtype_name(input->dtype()),wtype=dtype_name(weight->dtype());
++        if(input->dtype()!=output->dtype() || (input->dtype()==DataType::F32 && weight->dtype()!=DataType::F32))
++            throw std::invalid_argument("RMSNorm input/output dtype and weight pairing unsupported");
++        if(!std::isfinite(epsilon) || epsilon<0) throw std::invalid_argument("RMSNorm epsilon must be finite and nonnegative");
++        binary_=root_+"/tile"+std::to_string(layout_.tile)+"/kernels/"+data+"_"+wtype+"/kernel.hsaco";
++    }
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if(!layout_.rows) return;
++        auto output=output_,input=input_,weight=weight_;
++        const bool same=input->data()==output->data() && input->strides()==output->strides();
++        if(!same && byte_ranges_overlap(reinterpret_cast<uintptr_t>(input->data()),layout_.input_span,input->element_size(),reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++            throw std::invalid_argument("RMSNorm partially aliased input/output");
++        if(byte_ranges_overlap(reinterpret_cast<uintptr_t>(weight->data()),layout_.shape[2],weight->element_size(),reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++            throw std::invalid_argument("RMSNorm output aliases shared weight");
++        if(context::getDevice()!=output->device()) context::setDevice(output->device());
++        LaunchArguments args(layout_,input->data(),weight->data(),output->data(),epsilon_); auto &host=runtime(root_);
++        if(host.launch(binary_.c_str(),layout_.tile,layout_.rows,layout_.shape[2],context::getStream(),args.arguments.data()))
++            throw std::runtime_error(std::string("NineToothed RMSNorm launch failed: ")+host.error());
++    }
++};
++}
++bool enabled() { auto root=std::getenv("INFINICORE_NINETOOTHED_RMS_NORM_ROOT"); return root && root[0]; }
++void execute(Tensor output,const Tensor &input,const Tensor &weight,float epsilon) {
++    auto root=std::getenv("INFINICORE_NINETOOTHED_RMS_NORM_ROOT"); if(!root || !root[0]) throw std::runtime_error("RMSNorm root missing");
++    auto op=std::make_shared<Operator>(output,input,weight,epsilon,root);
++    if(context::isGraphRecording()) context::addGraphOperator(op); else op->run();
++}
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/rms_norm/ninetoothed/rms_norm_ninetoothed.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++namespace infinicore::op::rms_norm_impl::ninetoothed {
++bool enabled();
++void execute(Tensor output,const Tensor &input,const Tensor &weight,float epsilon);
++}
+--- a/InfiniCore/src/infinicore/ops/rms_norm/rms_norm.cc
++++ b/InfiniCore/src/infinicore/ops/rms_norm/rms_norm.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/rms_norm.hpp"
+ #include "../../utils.hpp"
++#include "ninetoothed/rms_norm_ninetoothed.hpp"
+ 
+ namespace infinicore::op {
+ INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(RMSNorm);
+@@ -20,6 +21,12 @@
+ }
+ 
+ void rms_norm_(Tensor y, const Tensor &x, const Tensor &weight, float epsilon) {
++    if(!y || !x || !weight || y->shape()!=x->shape() || weight->ndim()!=1)
++        throw std::invalid_argument("rms_norm_ requires matching non-null input/output and rank-1 weight");
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(y,x,weight);
++    if(x->device().getType()==Device::Type::HYGON && rms_norm_impl::ninetoothed::enabled()) {
++        rms_norm_impl::ninetoothed::execute(y,x,weight,epsilon); return;
++    }
+     RMSNorm::execute(y, x, weight, epsilon);
+ }
+ 
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/silu/ninetoothed/silu_layout.hpp
+@@ -0,0 +1,9 @@
++#pragma once
++// Reuse host-only metadata/ABI utilities; no Cast numerical kernel is called.
++#include "../../cast/ninetoothed/cast_layout.hpp"
++namespace infinicore::op::silu_impl::ninetoothed {
++using cast_impl::ninetoothed::Layout;
++using cast_impl::ninetoothed::LaunchArguments;
++using cast_impl::ninetoothed::normalize_layout;
++using cast_impl::ninetoothed::byte_ranges_overlap;
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/silu/ninetoothed/silu_ninetoothed.cc
+@@ -0,0 +1,73 @@
++#include "silu_ninetoothed.hpp"
++#include "silu_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++namespace infinicore::op::silu_impl::ninetoothed {
++namespace {
++using Launch=int(*)(const char *,int,unsigned,void *,void **);
++using Error=const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex; static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    const auto found=cache.find(root); if(found!=cache.end()) return found->second;
++    auto handle=dlopen((root+"/libminimax_nine_silu_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!handle) throw std::runtime_error(std::string("NineToothed SiLU host load failed: ")+dlerror());
++    auto launch=reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_silu_launch"));
++    auto error=reinterpret_cast<Error>(dlsym(handle,"minimax_nine_silu_error"));
++    if(!launch || !error) { dlclose(handle); throw std::runtime_error("NineToothed SiLU host ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root; throw std::runtime_error("Precompiled NineToothed SiLU requires Linux");
++#endif
++}
++const char *dtype_name(DataType type) {
++    switch(type) {
++    case DataType::F32:return "f32"; case DataType::F16:return "f16"; case DataType::BF16:return "bf16";
++    default:throw std::invalid_argument("NineToothed SiLU supports F32/F16/BF16; no numerical fallback");
++    }
++}
++class SiluOperator final : public graph::GraphOperator {
++    graph::GraphTensor output_,input_;
++    Layout layout_;
++    std::string root_,binary_;
++public:
++    SiluOperator(Tensor output,const Tensor &input,std::string root)
++        :output_(output),input_(input),layout_(normalize_layout(input->shape(),input->strides(),output->strides())),root_(std::move(root)) {
++        const std::string name=dtype_name(input->dtype());
++        if(output->dtype()!=input->dtype()) throw std::invalid_argument("SiLU input/output dtype must match");
++        binary_=root_+"/rank"+std::to_string(layout_.rank)+"/kernels/"+name+"/kernel.hsaco";
++    }
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if(!layout_.elements) return;
++        auto output=output_,input=input_;
++        const bool same_view=input->data()==output->data() && input->strides()==output->strides();
++        if(!same_view && byte_ranges_overlap(reinterpret_cast<uintptr_t>(input->data()),layout_.input_span,input->element_size(),
++                reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++            throw std::invalid_argument("SiLU rejects partially aliased input/output spans");
++        if(context::getDevice()!=output->device()) context::setDevice(output->device());
++        LaunchArguments arguments(layout_,input->data(),output->data());
++        auto &host=runtime(root_);
++        if(host.launch(binary_.c_str(),layout_.rank,layout_.grid,context::getStream(),arguments.arguments.data()))
++            throw std::runtime_error(std::string("NineToothed SiLU launch failed: ")+host.error());
++    }
++};
++}
++bool enabled() { const auto root=std::getenv("INFINICORE_NINETOOTHED_SILU_ROOT"); return root && root[0]; }
++void execute(Tensor output,const Tensor &input) {
++    const auto root=std::getenv("INFINICORE_NINETOOTHED_SILU_ROOT");
++    if(!root || !root[0]) throw std::runtime_error("NineToothed SiLU root missing");
++    auto op=std::make_shared<SiluOperator>(output,input,root);
++    if(context::isGraphRecording()) context::addGraphOperator(op); else op->run();
++}
++} // namespace infinicore::op::silu_impl::ninetoothed
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/silu/ninetoothed/silu_ninetoothed.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++namespace infinicore::op::silu_impl::ninetoothed {
++bool enabled();
++void execute(Tensor output,const Tensor &input);
++}
+--- a/InfiniCore/src/infinicore/ops/silu/silu.cc
++++ b/InfiniCore/src/infinicore/ops/silu/silu.cc
+@@ -1,6 +1,7 @@
+ #include "infinicore/ops/silu.hpp"
+ 
+ #include "../../utils.hpp"
++#include "ninetoothed/silu_ninetoothed.hpp"
+ 
+ namespace infinicore::op {
+ 
+@@ -23,6 +24,12 @@
+ }
+ 
+ void silu_(Tensor output, Tensor input) {
++    if(!output || !input || output->shape()!=input->shape()) throw std::invalid_argument("silu_ expects equal non-null shapes");
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(output,input);
++    if(input->device().getType()==Device::Type::HYGON && silu_impl::ninetoothed::enabled()) {
++        silu_impl::ninetoothed::execute(output,input);
++        return;
++    }
+     Silu::execute(output, input);
+ }
+ } // namespace infinicore::op
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/swiglu/ninetoothed/swiglu_layout.hpp
+@@ -0,0 +1,100 @@
++#pragma once
++// Host metadata only. Numerical operations are in the NineToothed definition.
++#include "../../cast/ninetoothed/cast_layout.hpp"
++
++namespace infinicore::op::swiglu_impl::ninetoothed {
++using cast_impl::ninetoothed::checked_add;
++using cast_impl::ninetoothed::checked_mul;
++using cast_impl::ninetoothed::byte_ranges_overlap;
++
++struct Layout {
++    std::array<int64_t,8> shape{},up_strides{},gate_strides{},output_strides{};
++    uint64_t elements=0,up_span=0,gate_span=0,output_span=0;
++    uint32_t grid=0;
++    int rank=1;
++};
++
++inline Layout normalize_layout(const std::vector<size_t> &shape,
++    const std::vector<ptrdiff_t> &up,const std::vector<ptrdiff_t> &gate,
++    const std::vector<ptrdiff_t> &output) {
++    if(shape.size()>8 || shape.size()!=up.size() || shape.size()!=gate.size() || shape.size()!=output.size())
++        throw std::invalid_argument("NineToothed SwiGLU requires matching rank 0 through 8 metadata");
++    Layout result; result.shape.fill(1);
++    bool empty=false;
++    for(size_t i=0;i<shape.size();++i) {
++        if(shape[i]>uint64_t(INT64_MAX) || up[i]<0 || gate[i]<0 || output[i]<0)
++            throw std::invalid_argument("NineToothed SwiGLU requires nonnegative int64 metadata");
++        empty=empty || shape[i]==0;
++    }
++    if(empty) { result.shape[7]=0; return result; }
++    result.elements=1;
++    uint64_t ul=0,gl=0,ol=0;
++    std::vector<int64_t> sizes,us,gs,os;
++    std::vector<std::pair<uint64_t,uint64_t>> output_axes;
++    for(size_t i=0;i<shape.size();++i) {
++        result.elements=checked_mul(result.elements,shape[i]);
++        ul=checked_add(ul,checked_mul(shape[i]-1,up[i]));
++        gl=checked_add(gl,checked_mul(shape[i]-1,gate[i]));
++        ol=checked_add(ol,checked_mul(shape[i]-1,output[i]));
++        if(shape[i]>1) {
++            sizes.push_back(shape[i]); us.push_back(up[i]); gs.push_back(gate[i]); os.push_back(output[i]);
++            output_axes.emplace_back(output[i],shape[i]);
++        }
++    }
++    std::sort(output_axes.begin(),output_axes.end());
++    uint64_t covered=1;
++    for(const auto &axis:output_axes) {
++        if(axis.first<covered) throw std::invalid_argument("NineToothed SwiGLU output view may overlap");
++        covered=checked_add(covered,checked_mul(axis.second-1,axis.first));
++    }
++    result.up_span=checked_add(ul,1); result.gate_span=checked_add(gl,1); result.output_span=checked_add(ol,1);
++    // Collapse an axis only when all three tensors share the same linear order.
++    for(size_t i=sizes.size();i>1;--i) {
++        const size_t j=i-2;
++        if(uint64_t(us[j])==checked_mul(us[j+1],sizes[j+1]) &&
++           uint64_t(gs[j])==checked_mul(gs[j+1],sizes[j+1]) &&
++           uint64_t(os[j])==checked_mul(os[j+1],sizes[j+1])) {
++            sizes[j]=checked_mul(sizes[j],sizes[j+1]); us[j]=us[j+1]; gs[j]=gs[j+1]; os[j]=os[j+1];
++            sizes.erase(sizes.begin()+j+1); us.erase(us.begin()+j+1); gs.erase(gs.begin()+j+1); os.erase(os.begin()+j+1);
++        }
++    }
++    if(sizes.empty()) { sizes.push_back(1); us.push_back(1); gs.push_back(1); os.push_back(1); }
++    const size_t start=8-sizes.size();
++    for(size_t i=0;i<sizes.size();++i) {
++        result.shape[start+i]=sizes[i]; result.up_strides[start+i]=us[i]; result.gate_strides[start+i]=gs[i]; result.output_strides[start+i]=os[i];
++    }
++    // The standard rank-1 generator computes pid*tile in i32. Route larger
++    // linear extents through rank 8, whose runtime size divisions promote the
++    // index before multiplication. Strides remain i64 in both variants.
++    result.rank=sizes.size()==1 && sizes[0]<=INT32_MAX?1:8;
++    uint64_t grid=1+(uint64_t(result.shape[7])-1)/256;
++    for(size_t i=0;i<7;++i) grid=checked_mul(grid,result.shape[i]);
++    if(grid>INT32_MAX) throw std::invalid_argument("NineToothed SwiGLU grid exceeds supported x dimension");
++    result.grid=grid;
++    return result;
++}
++
++struct LaunchArguments {
++    std::array<void *,3> data;
++    std::array<int64_t,48> scalars{};
++    std::array<void *,53> arguments{};
++    void *global_scratch=nullptr,*profile_scratch=nullptr;
++    LaunchArguments(const Layout &layout,void *up,void *gate,void *output):data{up,gate,output} {
++        const int rank=layout.rank;
++        const std::array<std::array<int64_t,8>,3> strides{layout.up_strides,layout.gate_strides,layout.output_strides};
++        for(int tensor=0;tensor<3;++tensor) {
++            const int base=tensor*(1+2*rank); arguments[base]=&data[tensor];
++            for(int dim=0;dim<rank;++dim) {
++                const int index=8-rank+dim;
++                scalars[tensor*2*rank+dim]=layout.shape[index];
++                scalars[tensor*2*rank+rank+dim]=strides[tensor][index];
++                arguments[base+1+dim]=&scalars[tensor*2*rank+dim];
++                arguments[base+1+rank+dim]=&scalars[tensor*2*rank+rank+dim];
++            }
++        }
++        arguments[3+6*rank]=&global_scratch; arguments[4+6*rank]=&profile_scratch;
++    }
++    LaunchArguments(const LaunchArguments &)=delete;
++    LaunchArguments &operator=(const LaunchArguments &)=delete;
++};
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/swiglu/ninetoothed/swiglu_ninetoothed.cc
+@@ -0,0 +1,76 @@
++#include "swiglu_ninetoothed.hpp"
++#include "swiglu_layout.hpp"
++#include <infinicore/context/context.hpp>
++#include <infinicore/graph/graph.hpp>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++namespace infinicore::op::swiglu_impl::ninetoothed {
++namespace {
++using Launch=int(*)(const char *,int,unsigned,void *,void **);
++using Error=const char *(*)();
++struct Runtime { void *handle; Launch launch; Error error; };
++Runtime &runtime(const std::string &root) {
++#if defined(__linux__)
++    static std::mutex mutex; static std::unordered_map<std::string,Runtime> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found=cache.find(root); if(found!=cache.end()) return found->second;
++    auto handle=dlopen((root+"/libminimax_nine_swiglu_runtime.so").c_str(),RTLD_NOW|RTLD_LOCAL);
++    if(!handle) throw std::runtime_error(std::string("NineToothed SwiGLU host load failed: ")+dlerror());
++    auto launch=reinterpret_cast<Launch>(dlsym(handle,"minimax_nine_swiglu_launch"));
++    auto error=reinterpret_cast<Error>(dlsym(handle,"minimax_nine_swiglu_error"));
++    if(!launch || !error) { dlclose(handle); throw std::runtime_error("NineToothed SwiGLU host ABI mismatch"); }
++    return cache.emplace(root,Runtime{handle,launch,error}).first->second;
++#else
++    (void)root; throw std::runtime_error("Precompiled NineToothed SwiGLU requires Linux");
++#endif
++}
++const char *dtype_name(DataType type) {
++    switch(type) {
++    case DataType::F32:return "f32"; case DataType::F16:return "f16"; case DataType::BF16:return "bf16";
++    default:throw std::invalid_argument("NineToothed SwiGLU supports F32/F16/BF16; no numerical fallback");
++    }
++}
++class SwiGLUOperator final:public graph::GraphOperator {
++    graph::GraphTensor output_,up_,gate_;
++    Layout layout_;
++    std::string root_,binary_;
++public:
++    SwiGLUOperator(Tensor output,const Tensor &up,const Tensor &gate,std::string root)
++        :output_(output),up_(up),gate_(gate),layout_(normalize_layout(up->shape(),up->strides(),gate->strides(),output->strides())),root_(std::move(root)) {
++        const std::string name=dtype_name(up->dtype());
++        if(output->dtype()!=up->dtype() || gate->dtype()!=up->dtype()) throw std::invalid_argument("SwiGLU dtypes must match");
++        binary_=root_+"/rank"+std::to_string(layout_.rank)+"/kernels/"+name+"/kernel.hsaco";
++    }
++    bool is_device_graph_capture_safe() const override { return false; }
++    void run() const override {
++        if(!layout_.elements) return;
++        auto output=output_,up=up_,gate=gate_;
++        for(const auto &input:{up,gate}) {
++            const bool same_view=input->data()==output->data() && input->strides()==output->strides();
++            const auto span=input==up?layout_.up_span:layout_.gate_span;
++            if(!same_view && byte_ranges_overlap(reinterpret_cast<uintptr_t>(input->data()),span,input->element_size(),
++                    reinterpret_cast<uintptr_t>(output->data()),layout_.output_span,output->element_size()))
++                throw std::invalid_argument("SwiGLU rejects partially aliased input/output spans");
++        }
++        if(context::getDevice()!=output->device()) context::setDevice(output->device());
++        LaunchArguments arguments(layout_,up->data(),gate->data(),output->data());
++        auto &host=runtime(root_);
++        if(host.launch(binary_.c_str(),layout_.rank,layout_.grid,context::getStream(),arguments.arguments.data()))
++            throw std::runtime_error(std::string("NineToothed SwiGLU launch failed: ")+host.error());
++    }
++};
++}
++bool enabled() { const auto root=std::getenv("INFINICORE_NINETOOTHED_SWIGLU_ROOT"); return root && root[0]; }
++void execute(Tensor output,const Tensor &up,const Tensor &gate) {
++    const auto root=std::getenv("INFINICORE_NINETOOTHED_SWIGLU_ROOT");
++    if(!root || !root[0]) throw std::runtime_error("NineToothed SwiGLU root missing");
++    auto op=std::make_shared<SwiGLUOperator>(output,up,gate,root);
++    if(context::isGraphRecording()) context::addGraphOperator(op); else op->run();
++}
++}
+--- /dev/null
++++ b/InfiniCore/src/infinicore/ops/swiglu/ninetoothed/swiglu_ninetoothed.hpp
+@@ -0,0 +1,6 @@
++#pragma once
++#include <infinicore/tensor.hpp>
++namespace infinicore::op::swiglu_impl::ninetoothed {
++bool enabled();
++void execute(Tensor output,const Tensor &up,const Tensor &gate);
++}
+--- a/InfiniCore/src/infinicore/ops/swiglu/swiglu.cc
++++ b/InfiniCore/src/infinicore/ops/swiglu/swiglu.cc
+@@ -1,5 +1,6 @@
+ #include "infinicore/ops/swiglu.hpp"
+ #include "../../utils.hpp"
++#include "ninetoothed/swiglu_ninetoothed.hpp"
+ 
+ namespace infinicore::op {
+ INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(SwiGLU);
+@@ -20,6 +21,13 @@
+ }
+ 
+ void swiglu_(Tensor c, const Tensor &a, const Tensor &b) {
++    if(!c || !a || !b || c->shape()!=a->shape() || a->shape()!=b->shape())
++        throw std::invalid_argument("swiglu_ expects equal non-null shapes");
++    INFINICORE_ASSERT_TENSORS_SAME_DEVICE(c,a,b);
++    if(a->device().getType()==Device::Type::HYGON && swiglu_impl::ninetoothed::enabled()) {
++        swiglu_impl::ninetoothed::execute(c,a,b);
++        return;
++    }
+     constexpr Size MAX_ELEMENTS_PER_LAUNCH = Size{1} << 30;
+     INFINICORE_ASSERT(c->shape() == a->shape());
+     INFINICORE_ASSERT(a->shape() == b->shape());
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/cpu/dist_cpu.cc
+@@ -0,0 +1,144 @@
++#include "dist_cpu.h"
++#include "../../../tensor.h"
++#include <algorithm>
++#include <cmath>
++
++namespace op::dist::cpu {
++
++utils::Result<DistInfo> DistInfo::create(
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    infiniopTensorDescriptor_t y_desc,
++    double p) {
++
++    auto x1_shape = x1_desc->shape();
++    auto x2_shape = x2_desc->shape();
++    auto y_shape = y_desc->shape();
++
++    // Check that x1 and x2 have same shape
++    if (x1_shape != x2_shape) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    // Check that y is a scalar (0D tensor or shape [1])
++    if (y_shape.size() != 0 && (y_shape.size() != 1 || y_shape[0] != 1)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    DistInfo info;
++    info.input_size = x1_desc->numel();
++    info.p = p;
++    info.x1_strides = x1_desc->strides();
++    info.x2_strides = x2_desc->strides();
++    info.shape = x1_shape;
++    info.ndim = x1_desc->ndim();
++
++    return utils::Result<DistInfo>(std::move(info));
++}
++
++Descriptor::~Descriptor() = default;
++
++infiniStatus_t Descriptor::create(
++    infiniopHandle_t handle,
++    Descriptor **desc_ptr,
++    infiniopTensorDescriptor_t y_desc,
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    double p) {
++
++    auto dtype = x1_desc->dtype();
++    CHECK_DTYPE(dtype, INFINI_DTYPE_F16, INFINI_DTYPE_F32, INFINI_DTYPE_F64, INFINI_DTYPE_BF16);
++
++    auto info_result = DistInfo::create(x1_desc, x2_desc, y_desc, p);
++    CHECK_RESULT(info_result);
++
++    *desc_ptr = new Descriptor(dtype, info_result.take(), handle->device, handle->device_id);
++    return INFINI_STATUS_SUCCESS;
++}
++
++template <typename T>
++void dist_impl(
++    const DistInfo &info,
++    T *y,
++    const T *x1,
++    const T *x2) {
++
++    double sum = 0.0;
++    const double p = info.p;
++
++    for (size_t i = 0; i < info.input_size; ++i) {
++        size_t idx1 = info.x1_strides.size() == 1 && info.x1_strides[0] == 1
++                        ? i
++                        : op::common_cpu::indexToOffset(i, info.ndim, info.shape.data(), info.x1_strides.data());
++        size_t idx2 = info.x2_strides.size() == 1 && info.x2_strides[0] == 1
++                        ? i
++                        : op::common_cpu::indexToOffset(i, info.ndim, info.shape.data(), info.x2_strides.data());
++
++        double diff = utils::cast<double>(x1[idx1]) - utils::cast<double>(x2[idx2]);
++        double abs_diff = std::abs(diff);
++
++        if (p == 0.0) {
++            // L0 norm: count non-zero differences
++            if (abs_diff > 1e-10) {
++                sum += 1.0;
++            }
++        } else if (p == std::numeric_limits<double>::infinity()) {
++            // L-infinity norm: max absolute difference
++            sum = std::max(sum, abs_diff);
++        } else {
++            // Lp norm: sum of |diff|^p
++            sum += std::pow(abs_diff, p);
++        }
++    }
++
++    // Take p-th root (except for p=0 and p=inf)
++    if (p == 0.0) {
++        *y = utils::cast<T>(sum);
++    } else if (p == std::numeric_limits<double>::infinity()) {
++        *y = utils::cast<T>(sum);
++    } else {
++        *y = utils::cast<T>(std::pow(sum, 1.0 / p));
++    }
++}
++
++infiniStatus_t Descriptor::calculate(
++    void *workspace,
++    size_t workspace_size,
++    void *y,
++    const void *x1,
++    const void *x2,
++    void *stream) const {
++
++    switch (_dtype) {
++    case INFINI_DTYPE_F16: {
++        dist_impl<fp16_t>(_info, reinterpret_cast<fp16_t *>(y),
++                          reinterpret_cast<const fp16_t *>(x1),
++                          reinterpret_cast<const fp16_t *>(x2));
++        break;
++    }
++    case INFINI_DTYPE_BF16: {
++        dist_impl<bf16_t>(_info, reinterpret_cast<bf16_t *>(y),
++                          reinterpret_cast<const bf16_t *>(x1),
++                          reinterpret_cast<const bf16_t *>(x2));
++        break;
++    }
++    case INFINI_DTYPE_F32: {
++        dist_impl<float>(_info, reinterpret_cast<float *>(y),
++                         reinterpret_cast<const float *>(x1),
++                         reinterpret_cast<const float *>(x2));
++        break;
++    }
++    case INFINI_DTYPE_F64: {
++        dist_impl<double>(_info, reinterpret_cast<double *>(y),
++                          reinterpret_cast<const double *>(x1),
++                          reinterpret_cast<const double *>(x2));
++        break;
++    }
++    default:
++        return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    return INFINI_STATUS_SUCCESS;
++}
++
++} // namespace op::dist::cpu
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/cpu/dist_cpu.h
+@@ -0,0 +1,60 @@
++#ifndef __DIST_CPU_H__
++#define __DIST_CPU_H__
++
++#include "../../../devices/cpu/common_cpu.h"
++#include "../../../operator.h"
++#include <cmath>
++#include <vector>
++
++namespace op::dist::cpu {
++
++struct DistInfo {
++    size_t input_size;
++    double p;
++    std::vector<ptrdiff_t> x1_strides;
++    std::vector<ptrdiff_t> x2_strides;
++    std::vector<size_t> shape;
++    size_t ndim;
++
++    static utils::Result<DistInfo> create(
++        infiniopTensorDescriptor_t x1_desc,
++        infiniopTensorDescriptor_t x2_desc,
++        infiniopTensorDescriptor_t y_desc,
++        double p);
++};
++
++class Descriptor final : public InfiniopDescriptor {
++    infiniDtype_t _dtype;
++    DistInfo _info;
++
++    Descriptor(infiniDtype_t dtype, DistInfo info,
++               infiniDevice_t device_type, int device_id)
++        : InfiniopDescriptor{device_type, device_id},
++          _dtype(dtype),
++          _info(std::move(info)) {}
++
++public:
++    ~Descriptor();
++
++    static infiniStatus_t create(
++        infiniopHandle_t handle,
++        Descriptor **desc_ptr,
++        infiniopTensorDescriptor_t y_desc,
++        infiniopTensorDescriptor_t x1_desc,
++        infiniopTensorDescriptor_t x2_desc,
++        double p);
++
++    size_t workspaceSize() const { return 0; }
++
++    infiniStatus_t calculate(
++        void *workspace,
++        size_t workspace_size,
++        void *y,
++        const void *x1,
++        const void *x2,
++        void *stream) const;
++};
++
++} // namespace op::dist::cpu
++
++#endif // __DIST_CPU_H__
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/cuda/kernel.cuh
+@@ -0,0 +1,189 @@
++#include "../../../reduce/cuda/reduce.cuh"
++#include <cmath>
++#include <type_traits>
++
++struct DistIndexing {
++    static constexpr int kMaxNdim = 8;
++
++    int ndim;
++    int64_t shape[kMaxNdim];
++    int64_t x1_strides[kMaxNdim];
++    int64_t x2_strides[kMaxNdim];
++};
++
++namespace op::cuda {
++
++template <typename T>
++__device__ __forceinline__ float to_f32(T v) {
++    return static_cast<float>(v);
++}
++
++template <>
++__device__ __forceinline__ float to_f32<half>(half v) {
++    return __half2float(v);
++}
++
++template <>
++__device__ __forceinline__ float to_f32<cuda_bfloat16>(cuda_bfloat16 v) {
++    return __bfloat162float(v);
++}
++
++template <typename Tdata, typename Tcompute>
++__device__ __forceinline__ Tdata cast_out(Tcompute v) {
++    return static_cast<Tdata>(v);
++}
++
++template <>
++__device__ __forceinline__ half cast_out<half, float>(float v) {
++    return __float2half(v);
++}
++
++template <>
++__device__ __forceinline__ cuda_bfloat16 cast_out<cuda_bfloat16, float>(float v) {
++    return __float2bfloat16_rn(v);
++}
++
++template <unsigned int BLOCK_SIZE, typename Tdata, typename Tcompute>
++__global__ void dist_strided_kernel(
++    Tcompute *result,
++    const Tdata *x1,
++    const Tdata *x2,
++    size_t n,
++    double p,
++    DistIndexing indexing) {
++
++    Tcompute thread_val = static_cast<Tcompute>(0);
++
++    for (size_t linear = static_cast<size_t>(threadIdx.x); linear < n; linear += BLOCK_SIZE) {
++        int64_t idx[DistIndexing::kMaxNdim] = {0};
++        size_t tmp = linear;
++        for (int d = indexing.ndim - 1; d >= 0; --d) {
++            const int64_t s = indexing.shape[d];
++            idx[d] = static_cast<int64_t>(tmp % static_cast<size_t>(s));
++            tmp /= static_cast<size_t>(s);
++        }
++
++        int64_t off1 = 0;
++        int64_t off2 = 0;
++        for (int d = 0; d < indexing.ndim; ++d) {
++            off1 += idx[d] * indexing.x1_strides[d];
++            off2 += idx[d] * indexing.x2_strides[d];
++        }
++
++        Tcompute diff;
++        if constexpr (std::is_same_v<Tcompute, double>) {
++            diff = static_cast<double>(x1[off1]) - static_cast<double>(x2[off2]);
++        } else {
++            diff = static_cast<Tcompute>(to_f32(x1[off1]) - to_f32(x2[off2]));
++        }
++        const Tcompute abs_diff = fabs(diff);
++
++        if (p == 0.0) {
++            if (abs_diff > static_cast<Tcompute>(1e-10)) {
++                thread_val += static_cast<Tcompute>(1);
++            }
++        } else if (isinf(p)) {
++            thread_val = fmax(thread_val, abs_diff);
++        } else {
++            thread_val += pow(abs_diff, static_cast<Tcompute>(p));
++        }
++    }
++
++    using BlockReduce = cub::BlockReduce<Tcompute, BLOCK_SIZE>;
++    __shared__ typename BlockReduce::TempStorage temp_storage;
++
++    if (isinf(p)) {
++        struct MaxOp {
++            __device__ __forceinline__ Tcompute operator()(Tcompute a, Tcompute b) const {
++                return a > b ? a : b;
++            }
++        };
++        const Tcompute block_max = BlockReduce(temp_storage).Reduce(thread_val, MaxOp{});
++        if (threadIdx.x == 0) {
++            *result = block_max;
++        }
++        return;
++    }
++
++    const Tcompute block_sum = BlockReduce(temp_storage).Sum(thread_val);
++    if (threadIdx.x == 0) {
++        if (p == 0.0) {
++            *result = block_sum;
++        } else {
++            *result = pow(block_sum, static_cast<Tcompute>(1.0 / p));
++        }
++    }
++}
++
++template <unsigned int BLOCK_SIZE, typename Tdata, typename Tcompute>
++__global__ void dist_strided_out_kernel(
++    Tdata *out,
++    const Tdata *x1,
++    const Tdata *x2,
++    size_t n,
++    double p,
++    DistIndexing indexing) {
++
++    Tcompute thread_val = static_cast<Tcompute>(0);
++
++    for (size_t linear = static_cast<size_t>(threadIdx.x); linear < n; linear += BLOCK_SIZE) {
++        int64_t idx[DistIndexing::kMaxNdim] = {0};
++        size_t tmp = linear;
++        for (int d = indexing.ndim - 1; d >= 0; --d) {
++            const int64_t s = indexing.shape[d];
++            idx[d] = static_cast<int64_t>(tmp % static_cast<size_t>(s));
++            tmp /= static_cast<size_t>(s);
++        }
++
++        int64_t off1 = 0;
++        int64_t off2 = 0;
++        for (int d = 0; d < indexing.ndim; ++d) {
++            off1 += idx[d] * indexing.x1_strides[d];
++            off2 += idx[d] * indexing.x2_strides[d];
++        }
++
++        Tcompute diff;
++        if constexpr (std::is_same_v<Tcompute, double>) {
++            diff = static_cast<double>(x1[off1]) - static_cast<double>(x2[off2]);
++        } else {
++            diff = static_cast<Tcompute>(to_f32(x1[off1]) - to_f32(x2[off2]));
++        }
++        const Tcompute abs_diff = fabs(diff);
++
++        if (p == 0.0) {
++            if (abs_diff > static_cast<Tcompute>(1e-10)) {
++                thread_val += static_cast<Tcompute>(1);
++            }
++        } else if (isinf(p)) {
++            thread_val = fmax(thread_val, abs_diff);
++        } else {
++            thread_val += pow(abs_diff, static_cast<Tcompute>(p));
++        }
++    }
++
++    using BlockReduce = cub::BlockReduce<Tcompute, BLOCK_SIZE>;
++    __shared__ typename BlockReduce::TempStorage temp_storage;
++
++    if (isinf(p)) {
++        struct MaxOp {
++            __device__ __forceinline__ Tcompute operator()(Tcompute a, Tcompute b) const {
++                return a > b ? a : b;
++            }
++        };
++        const Tcompute block_max = BlockReduce(temp_storage).Reduce(thread_val, MaxOp{});
++        if (threadIdx.x == 0) {
++            *out = cast_out<Tdata, Tcompute>(block_max);
++        }
++        return;
++    }
++
++    const Tcompute block_sum = BlockReduce(temp_storage).Sum(thread_val);
++    if (threadIdx.x == 0) {
++        if (p == 0.0) {
++            *out = cast_out<Tdata, Tcompute>(block_sum);
++        } else {
++            *out = cast_out<Tdata, Tcompute>(pow(block_sum, static_cast<Tcompute>(1.0 / p)));
++        }
++    }
++}
++} // namespace op::cuda
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/metax/dist_metax.h
+@@ -0,0 +1,54 @@
++#ifndef __DIST_METAX_H__
++#define __DIST_METAX_H__
++
++#include "../../../operator.h"
++
++namespace op::dist::metax {
++
++class Descriptor final : public InfiniopDescriptor {
++    infiniDtype_t _dtype;
++    size_t _input_size;
++    double _p;
++    size_t _ndim;
++    std::vector<size_t> _shape;
++    std::vector<ptrdiff_t> _x1_strides;
++    std::vector<ptrdiff_t> _x2_strides;
++
++    Descriptor(infiniDtype_t dtype, size_t input_size, double p,
++               size_t ndim, std::vector<size_t> shape,
++               std::vector<ptrdiff_t> x1_strides, std::vector<ptrdiff_t> x2_strides,
++               infiniDevice_t device_type, int device_id)
++        : InfiniopDescriptor{device_type, device_id},
++          _dtype(dtype),
++          _input_size(input_size),
++          _p(p),
++          _ndim(ndim),
++          _shape(std::move(shape)),
++          _x1_strides(std::move(x1_strides)),
++          _x2_strides(std::move(x2_strides)) {}
++
++public:
++    ~Descriptor();
++
++    static infiniStatus_t create(
++        infiniopHandle_t handle,
++        Descriptor **desc_ptr,
++        infiniopTensorDescriptor_t y_desc,
++        infiniopTensorDescriptor_t x1_desc,
++        infiniopTensorDescriptor_t x2_desc,
++        double p);
++
++    size_t workspaceSize() const { return 0; }
++
++    infiniStatus_t calculate(
++        void *workspace,
++        size_t workspace_size,
++        void *y,
++        const void *x1,
++        const void *x2,
++        void *stream) const;
++};
++
++} // namespace op::dist::metax
++
++#endif // __DIST_METAX_H__
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/metax/dist_metax.maca
+@@ -0,0 +1,107 @@
++#include "../../../devices/metax/metax_common.h"
++#include "../../../devices/metax/metax_handle.h"
++#include "../../../devices/metax/metax_kernel_common.h"
++#include "../../../tensor.h"
++
++#include "../cuda/kernel.cuh"
++#include "dist_metax.h"
++
++namespace op::dist::metax {
++
++Descriptor::~Descriptor() = default;
++
++infiniStatus_t Descriptor::create(
++    infiniopHandle_t handle,
++    Descriptor **desc_ptr,
++    infiniopTensorDescriptor_t y_desc,
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    double p) {
++
++    auto dtype = x1_desc->dtype();
++    CHECK_DTYPE(dtype, INFINI_DTYPE_F16, INFINI_DTYPE_F32, INFINI_DTYPE_F64, INFINI_DTYPE_BF16);
++
++    auto x1_shape = x1_desc->shape();
++    auto x2_shape = x2_desc->shape();
++    auto y_shape = y_desc->shape();
++
++    if (x1_shape != x2_shape) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    if (y_shape.size() != 0 && (y_shape.size() != 1 || y_shape[0] != 1)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    const size_t ndim = x1_desc->ndim();
++    if (ndim > static_cast<size_t>(DistIndexing::kMaxNdim)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    size_t input_size = x1_desc->numel();
++    *desc_ptr = new Descriptor(dtype, input_size, p, ndim, x1_shape, x1_desc->strides(), x2_desc->strides(),
++                               handle->device, handle->device_id);
++    return INFINI_STATUS_SUCCESS;
++}
++
++infiniStatus_t Descriptor::calculate(
++    void *workspace,
++    size_t workspace_size,
++    void *y,
++    const void *x1,
++    const void *x2,
++    void *stream) const {
++
++    auto cuda_stream = reinterpret_cast<hcStream_t>(stream);
++    constexpr int BLOCK_SIZE = 256;
++
++    DistIndexing indexing{};
++    indexing.ndim = static_cast<int>(_ndim);
++    for (int d = 0; d < DistIndexing::kMaxNdim; ++d) {
++        indexing.shape[d] = 1;
++        indexing.x1_strides[d] = 0;
++        indexing.x2_strides[d] = 0;
++    }
++    for (size_t d = 0; d < _ndim; ++d) {
++        indexing.shape[d] = static_cast<int64_t>(_shape[d]);
++        indexing.x1_strides[d] = static_cast<int64_t>(_x1_strides[d]);
++        indexing.x2_strides[d] = static_cast<int64_t>(_x2_strides[d]);
++    }
++
++    switch (_dtype) {
++    case INFINI_DTYPE_F16: {
++        cuda::dist_strided_out_kernel<BLOCK_SIZE, half, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<half *>(y),
++            reinterpret_cast<const half *>(x1), reinterpret_cast<const half *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_BF16: {
++        cuda::dist_strided_out_kernel<BLOCK_SIZE, cuda_bfloat16, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<cuda_bfloat16 *>(y),
++            reinterpret_cast<const cuda_bfloat16 *>(x1), reinterpret_cast<const cuda_bfloat16 *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F32: {
++        float *result_f = reinterpret_cast<float *>(y);
++        cuda::dist_strided_kernel<BLOCK_SIZE, float, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_f, reinterpret_cast<const float *>(x1), reinterpret_cast<const float *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F64: {
++        double *result_d = reinterpret_cast<double *>(y);
++        cuda::dist_strided_kernel<BLOCK_SIZE, double, double><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_d, reinterpret_cast<const double *>(x1), reinterpret_cast<const double *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    default:
++        return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    return INFINI_STATUS_SUCCESS;
++}
++
++} // namespace op::dist::metax
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/moore/dist_moore.h
+@@ -0,0 +1,54 @@
++#ifndef __DIST_MOORE_H__
++#define __DIST_MOORE_H__
++
++#include "../../../operator.h"
++
++namespace op::dist::moore {
++
++class Descriptor final : public InfiniopDescriptor {
++    infiniDtype_t _dtype;
++    size_t _input_size;
++    double _p;
++    size_t _ndim;
++    std::vector<size_t> _shape;
++    std::vector<ptrdiff_t> _x1_strides;
++    std::vector<ptrdiff_t> _x2_strides;
++
++    Descriptor(infiniDtype_t dtype, size_t input_size, double p,
++               size_t ndim, std::vector<size_t> shape,
++               std::vector<ptrdiff_t> x1_strides, std::vector<ptrdiff_t> x2_strides,
++               infiniDevice_t device_type, int device_id)
++        : InfiniopDescriptor{device_type, device_id},
++          _dtype(dtype),
++          _input_size(input_size),
++          _p(p),
++          _ndim(ndim),
++          _shape(std::move(shape)),
++          _x1_strides(std::move(x1_strides)),
++          _x2_strides(std::move(x2_strides)) {}
++
++public:
++    ~Descriptor();
++
++    static infiniStatus_t create(
++        infiniopHandle_t handle,
++        Descriptor **desc_ptr,
++        infiniopTensorDescriptor_t y_desc,
++        infiniopTensorDescriptor_t x1_desc,
++        infiniopTensorDescriptor_t x2_desc,
++        double p);
++
++    size_t workspaceSize() const { return 0; }
++
++    infiniStatus_t calculate(
++        void *workspace,
++        size_t workspace_size,
++        void *y,
++        const void *x1,
++        const void *x2,
++        void *stream) const;
++};
++
++} // namespace op::dist::moore
++
++#endif // __DIST_MOORE_H__
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/moore/dist_moore.mu
+@@ -0,0 +1,107 @@
++#include "../../../devices/moore/moore_common.h"
++#include "../../../devices/moore/moore_handle.h"
++#include "../../../devices/moore/moore_kernel_common.h"
++#include "../../../tensor.h"
++
++#include "../cuda/kernel.cuh"
++#include "dist_moore.h"
++
++namespace op::dist::moore {
++
++Descriptor::~Descriptor() = default;
++
++infiniStatus_t Descriptor::create(
++    infiniopHandle_t handle,
++    Descriptor **desc_ptr,
++    infiniopTensorDescriptor_t y_desc,
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    double p) {
++
++    auto dtype = x1_desc->dtype();
++    CHECK_DTYPE(dtype, INFINI_DTYPE_F16, INFINI_DTYPE_F32, INFINI_DTYPE_F64, INFINI_DTYPE_BF16);
++
++    auto x1_shape = x1_desc->shape();
++    auto x2_shape = x2_desc->shape();
++    auto y_shape = y_desc->shape();
++
++    if (x1_shape != x2_shape) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    if (y_shape.size() != 0 && (y_shape.size() != 1 || y_shape[0] != 1)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    const size_t ndim = x1_desc->ndim();
++    if (ndim > static_cast<size_t>(DistIndexing::kMaxNdim)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    size_t input_size = x1_desc->numel();
++    *desc_ptr = new Descriptor(dtype, input_size, p, ndim, x1_shape, x1_desc->strides(), x2_desc->strides(),
++                               handle->device, handle->device_id);
++    return INFINI_STATUS_SUCCESS;
++}
++
++infiniStatus_t Descriptor::calculate(
++    void *workspace,
++    size_t workspace_size,
++    void *y,
++    const void *x1,
++    const void *x2,
++    void *stream) const {
++
++    auto cuda_stream = reinterpret_cast<musaStream_t>(stream);
++    constexpr int BLOCK_SIZE = 256;
++
++    DistIndexing indexing{};
++    indexing.ndim = static_cast<int>(_ndim);
++    for (int d = 0; d < DistIndexing::kMaxNdim; ++d) {
++        indexing.shape[d] = 1;
++        indexing.x1_strides[d] = 0;
++        indexing.x2_strides[d] = 0;
++    }
++    for (size_t d = 0; d < _ndim; ++d) {
++        indexing.shape[d] = static_cast<int64_t>(_shape[d]);
++        indexing.x1_strides[d] = static_cast<int64_t>(_x1_strides[d]);
++        indexing.x2_strides[d] = static_cast<int64_t>(_x2_strides[d]);
++    }
++
++    switch (_dtype) {
++    case INFINI_DTYPE_F16: {
++        cuda::dist_strided_out_kernel<BLOCK_SIZE, half, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<half *>(y),
++            reinterpret_cast<const half *>(x1), reinterpret_cast<const half *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_BF16: {
++        cuda::dist_strided_out_kernel<BLOCK_SIZE, cuda_bfloat16, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<cuda_bfloat16 *>(y),
++            reinterpret_cast<const cuda_bfloat16 *>(x1), reinterpret_cast<const cuda_bfloat16 *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F32: {
++        float *result_f = reinterpret_cast<float *>(y);
++        cuda::dist_strided_kernel<BLOCK_SIZE, float, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_f, reinterpret_cast<const float *>(x1), reinterpret_cast<const float *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F64: {
++        double *result_d = reinterpret_cast<double *>(y);
++        cuda::dist_strided_kernel<BLOCK_SIZE, double, double><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_d, reinterpret_cast<const double *>(x1), reinterpret_cast<const double *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    default:
++        return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    return INFINI_STATUS_SUCCESS;
++}
++
++} // namespace op::dist::moore
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/nvidia/dist_nvidia.cu
+@@ -0,0 +1,290 @@
++#include "../../../devices/nvidia/nvidia_kernel_common.cuh"
++#include "../../../tensor.h"
++#include "dist_nvidia.cuh"
++#include <cmath>
++#include <cstdint>
++#include <cub/block/block_reduce.cuh>
++#include <type_traits>
++
++namespace op::dist::nvidia {
++
++Descriptor::~Descriptor() = default;
++
++struct DistIndexing {
++    static constexpr int kMaxNdim = 8;
++
++    int ndim;
++    int64_t shape[kMaxNdim];
++    int64_t x1_strides[kMaxNdim];
++    int64_t x2_strides[kMaxNdim];
++};
++
++template <typename T>
++__device__ __forceinline__ float to_f32(T v) {
++    return static_cast<float>(v);
++}
++
++template <>
++__device__ __forceinline__ float to_f32<half>(half v) {
++    return __half2float(v);
++}
++
++template <>
++__device__ __forceinline__ float to_f32<cuda_bfloat16>(cuda_bfloat16 v) {
++    return __bfloat162float(v);
++}
++
++template <typename Tdata, typename Tcompute>
++__device__ __forceinline__ Tdata cast_out(Tcompute v) {
++    return static_cast<Tdata>(v);
++}
++
++template <>
++__device__ __forceinline__ half cast_out<half, float>(float v) {
++    return __float2half(v);
++}
++
++template <>
++__device__ __forceinline__ cuda_bfloat16 cast_out<cuda_bfloat16, float>(float v) {
++    return __float2bfloat16_rn(v);
++}
++
++template <unsigned int BLOCK_SIZE, typename Tdata, typename Tcompute>
++__global__ void dist_strided_kernel(
++    Tcompute *result,
++    const Tdata *x1,
++    const Tdata *x2,
++    size_t n,
++    double p,
++    DistIndexing indexing) {
++
++    Tcompute thread_val = static_cast<Tcompute>(0);
++
++    for (size_t linear = static_cast<size_t>(threadIdx.x); linear < n; linear += BLOCK_SIZE) {
++        int64_t idx[DistIndexing::kMaxNdim] = {0};
++        size_t tmp = linear;
++        for (int d = indexing.ndim - 1; d >= 0; --d) {
++            const int64_t s = indexing.shape[d];
++            idx[d] = static_cast<int64_t>(tmp % static_cast<size_t>(s));
++            tmp /= static_cast<size_t>(s);
++        }
++
++        int64_t off1 = 0;
++        int64_t off2 = 0;
++        for (int d = 0; d < indexing.ndim; ++d) {
++            off1 += idx[d] * indexing.x1_strides[d];
++            off2 += idx[d] * indexing.x2_strides[d];
++        }
++
++        Tcompute diff;
++        if constexpr (std::is_same_v<Tcompute, double>) {
++            diff = static_cast<double>(x1[off1]) - static_cast<double>(x2[off2]);
++        } else {
++            diff = static_cast<Tcompute>(to_f32(x1[off1]) - to_f32(x2[off2]));
++        }
++        const Tcompute abs_diff = fabs(diff);
++
++        if (p == 0.0) {
++            if (abs_diff > static_cast<Tcompute>(1e-10)) {
++                thread_val += static_cast<Tcompute>(1);
++            }
++        } else if (isinf(p)) {
++            thread_val = fmax(thread_val, abs_diff);
++        } else {
++            thread_val += pow(abs_diff, static_cast<Tcompute>(p));
++        }
++    }
++
++    using BlockReduce = cub::BlockReduce<Tcompute, BLOCK_SIZE>;
++    __shared__ typename BlockReduce::TempStorage temp_storage;
++
++    if (isinf(p)) {
++        struct MaxOp {
++            __device__ __forceinline__ Tcompute operator()(Tcompute a, Tcompute b) const {
++                return a > b ? a : b;
++            }
++        };
++        const Tcompute block_max = BlockReduce(temp_storage).Reduce(thread_val, MaxOp{});
++        if (threadIdx.x == 0) {
++            *result = block_max;
++        }
++        return;
++    }
++
++    const Tcompute block_sum = BlockReduce(temp_storage).Sum(thread_val);
++    if (threadIdx.x == 0) {
++        if (p == 0.0) {
++            *result = block_sum;
++        } else {
++            *result = pow(block_sum, static_cast<Tcompute>(1.0 / p));
++        }
++    }
++}
++
++template <unsigned int BLOCK_SIZE, typename Tdata, typename Tcompute>
++__global__ void dist_strided_out_kernel(
++    Tdata *out,
++    const Tdata *x1,
++    const Tdata *x2,
++    size_t n,
++    double p,
++    DistIndexing indexing) {
++
++    Tcompute thread_val = static_cast<Tcompute>(0);
++
++    for (size_t linear = static_cast<size_t>(threadIdx.x); linear < n; linear += BLOCK_SIZE) {
++        int64_t idx[DistIndexing::kMaxNdim] = {0};
++        size_t tmp = linear;
++        for (int d = indexing.ndim - 1; d >= 0; --d) {
++            const int64_t s = indexing.shape[d];
++            idx[d] = static_cast<int64_t>(tmp % static_cast<size_t>(s));
++            tmp /= static_cast<size_t>(s);
++        }
++
++        int64_t off1 = 0;
++        int64_t off2 = 0;
++        for (int d = 0; d < indexing.ndim; ++d) {
++            off1 += idx[d] * indexing.x1_strides[d];
++            off2 += idx[d] * indexing.x2_strides[d];
++        }
++
++        Tcompute diff;
++        if constexpr (std::is_same_v<Tcompute, double>) {
++            diff = static_cast<double>(x1[off1]) - static_cast<double>(x2[off2]);
++        } else {
++            diff = static_cast<Tcompute>(to_f32(x1[off1]) - to_f32(x2[off2]));
++        }
++        const Tcompute abs_diff = fabs(diff);
++
++        if (p == 0.0) {
++            if (abs_diff > static_cast<Tcompute>(1e-10)) {
++                thread_val += static_cast<Tcompute>(1);
++            }
++        } else if (isinf(p)) {
++            thread_val = fmax(thread_val, abs_diff);
++        } else {
++            thread_val += pow(abs_diff, static_cast<Tcompute>(p));
++        }
++    }
++
++    using BlockReduce = cub::BlockReduce<Tcompute, BLOCK_SIZE>;
++    __shared__ typename BlockReduce::TempStorage temp_storage;
++
++    if (isinf(p)) {
++        struct MaxOp {
++            __device__ __forceinline__ Tcompute operator()(Tcompute a, Tcompute b) const {
++                return a > b ? a : b;
++            }
++        };
++        const Tcompute block_max = BlockReduce(temp_storage).Reduce(thread_val, MaxOp{});
++        if (threadIdx.x == 0) {
++            *out = cast_out<Tdata, Tcompute>(block_max);
++        }
++        return;
++    }
++
++    const Tcompute block_sum = BlockReduce(temp_storage).Sum(thread_val);
++    if (threadIdx.x == 0) {
++        if (p == 0.0) {
++            *out = cast_out<Tdata, Tcompute>(block_sum);
++        } else {
++            *out = cast_out<Tdata, Tcompute>(pow(block_sum, static_cast<Tcompute>(1.0 / p)));
++        }
++    }
++}
++
++infiniStatus_t Descriptor::create(
++    infiniopHandle_t handle,
++    Descriptor **desc_ptr,
++    infiniopTensorDescriptor_t y_desc,
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    double p) {
++
++    auto dtype = x1_desc->dtype();
++    CHECK_DTYPE(dtype, INFINI_DTYPE_F16, INFINI_DTYPE_F32, INFINI_DTYPE_F64, INFINI_DTYPE_BF16);
++
++    auto x1_shape = x1_desc->shape();
++    auto x2_shape = x2_desc->shape();
++    auto y_shape = y_desc->shape();
++
++    if (x1_shape != x2_shape) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    if (y_shape.size() != 0 && (y_shape.size() != 1 || y_shape[0] != 1)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    const size_t ndim = x1_desc->ndim();
++    if (ndim > static_cast<size_t>(DistIndexing::kMaxNdim)) {
++        return INFINI_STATUS_BAD_TENSOR_SHAPE;
++    }
++
++    size_t input_size = x1_desc->numel();
++    *desc_ptr = new Descriptor(dtype, input_size, p, ndim, x1_shape, x1_desc->strides(), x2_desc->strides(),
++                               handle->device, handle->device_id);
++    return INFINI_STATUS_SUCCESS;
++}
++
++infiniStatus_t Descriptor::calculate(
++    void *workspace,
++    size_t workspace_size,
++    void *y,
++    const void *x1,
++    const void *x2,
++    void *stream) const {
++
++    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++    constexpr int BLOCK_SIZE = 256;
++
++    DistIndexing indexing{};
++    indexing.ndim = static_cast<int>(_ndim);
++    for (int d = 0; d < DistIndexing::kMaxNdim; ++d) {
++        indexing.shape[d] = 1;
++        indexing.x1_strides[d] = 0;
++        indexing.x2_strides[d] = 0;
++    }
++    for (size_t d = 0; d < _ndim; ++d) {
++        indexing.shape[d] = static_cast<int64_t>(_shape[d]);
++        indexing.x1_strides[d] = static_cast<int64_t>(_x1_strides[d]);
++        indexing.x2_strides[d] = static_cast<int64_t>(_x2_strides[d]);
++    }
++
++    switch (_dtype) {
++    case INFINI_DTYPE_F16: {
++        dist_strided_out_kernel<BLOCK_SIZE, half, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<half *>(y),
++            reinterpret_cast<const half *>(x1), reinterpret_cast<const half *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_BF16: {
++        dist_strided_out_kernel<BLOCK_SIZE, cuda_bfloat16, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            reinterpret_cast<cuda_bfloat16 *>(y),
++            reinterpret_cast<const cuda_bfloat16 *>(x1), reinterpret_cast<const cuda_bfloat16 *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F32: {
++        float *result_f = reinterpret_cast<float *>(y);
++        dist_strided_kernel<BLOCK_SIZE, float, float><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_f, reinterpret_cast<const float *>(x1), reinterpret_cast<const float *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    case INFINI_DTYPE_F64: {
++        double *result_d = reinterpret_cast<double *>(y);
++        dist_strided_kernel<BLOCK_SIZE, double, double><<<1, BLOCK_SIZE, 0, cuda_stream>>>(
++            result_d, reinterpret_cast<const double *>(x1), reinterpret_cast<const double *>(x2),
++            _input_size, _p, indexing);
++        break;
++    }
++    default:
++        return INFINI_STATUS_BAD_TENSOR_DTYPE;
++    }
++
++    return INFINI_STATUS_SUCCESS;
++}
++
++} // namespace op::dist::nvidia
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/nvidia/dist_nvidia.cuh
+@@ -0,0 +1,57 @@
++#ifndef __DIST_NVIDIA_H__
++#define __DIST_NVIDIA_H__
++
++#include "../../../devices/nvidia/nvidia_common.cuh"
++#include "../../../operator.h"
++#include <cstddef>
++#include <vector>
++
++namespace op::dist::nvidia {
++
++class Descriptor final : public InfiniopDescriptor {
++    infiniDtype_t _dtype;
++    size_t _input_size;
++    double _p;
++    size_t _ndim;
++    std::vector<size_t> _shape;
++    std::vector<ptrdiff_t> _x1_strides;
++    std::vector<ptrdiff_t> _x2_strides;
++
++    Descriptor(infiniDtype_t dtype, size_t input_size, double p,
++               size_t ndim, std::vector<size_t> shape,
++               std::vector<ptrdiff_t> x1_strides, std::vector<ptrdiff_t> x2_strides,
++               infiniDevice_t device_type, int device_id)
++        : InfiniopDescriptor{device_type, device_id},
++          _dtype(dtype),
++          _input_size(input_size),
++          _p(p),
++          _ndim(ndim),
++          _shape(std::move(shape)),
++          _x1_strides(std::move(x1_strides)),
++          _x2_strides(std::move(x2_strides)) {}
++
++public:
++    ~Descriptor();
++
++    static infiniStatus_t create(
++        infiniopHandle_t handle,
++        Descriptor **desc_ptr,
++        infiniopTensorDescriptor_t y_desc,
++        infiniopTensorDescriptor_t x1_desc,
++        infiniopTensorDescriptor_t x2_desc,
++        double p);
++
++    size_t workspaceSize() const { return 0; }
++
++    infiniStatus_t calculate(
++        void *workspace,
++        size_t workspace_size,
++        void *y,
++        const void *x1,
++        const void *x2,
++        void *stream) const;
++};
++
++} // namespace op::dist::nvidia
++
++#endif // __DIST_NVIDIA_H__
+--- /dev/null
++++ b/InfiniCore/src/infiniop/ops/dist/operator.cc
+@@ -0,0 +1,162 @@
++#include "../../operator.h"
++#include "../../handle.h"
++#include "infiniop/ops/dist.h"
++
++#ifdef ENABLE_CPU_API
++#include "cpu/dist_cpu.h"
++#endif
++#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_QY_API)
++#include "nvidia/dist_nvidia.cuh"
++#endif
++#ifdef ENABLE_METAX_API
++#include "metax/dist_metax.h"
++#endif
++#ifdef ENABLE_MOORE_API
++#include "moore/dist_moore.h"
++#endif
++
++__INFINI_C infiniStatus_t infiniopCreateDistDescriptor(
++    infiniopHandle_t handle,
++    infiniopDistDescriptor_t *desc_ptr,
++    infiniopTensorDescriptor_t y_desc,
++    infiniopTensorDescriptor_t x1_desc,
++    infiniopTensorDescriptor_t x2_desc,
++    double p) {
++
++#define CREATE(CASE, NAMESPACE)                                             \
++    case CASE:                                                              \
++        return op::dist::NAMESPACE::Descriptor::create(                     \
++            handle,                                                         \
++            reinterpret_cast<op::dist::NAMESPACE::Descriptor **>(desc_ptr), \
++            y_desc,                                                         \
++            x1_desc,                                                        \
++            x2_desc,                                                        \
++            p)
++
++    switch (handle->device) {
++
++#ifdef ENABLE_CPU_API
++        CREATE(INFINI_DEVICE_CPU, cpu);
++#endif
++#ifdef ENABLE_NVIDIA_API
++        CREATE(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_QY_API
++        CREATE(INFINI_DEVICE_QY, nvidia);
++#endif
++#ifdef ENABLE_METAX_API
++        CREATE(INFINI_DEVICE_METAX, metax);
++#endif
++#ifdef ENABLE_MOORE_API
++        CREATE(INFINI_DEVICE_MOORE, moore);
++#endif
++
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef CREATE
++}
++
++__INFINI_C infiniStatus_t infiniopGetDistWorkspaceSize(infiniopDistDescriptor_t desc, size_t *size) {
++
++#define GET(CASE, NAMESPACE)                                                                \
++    case CASE:                                                                              \
++        *size = reinterpret_cast<op::dist::NAMESPACE::Descriptor *>(desc)->workspaceSize(); \
++        return INFINI_STATUS_SUCCESS;
++
++    switch (desc->device_type) {
++#ifdef ENABLE_CPU_API
++        GET(INFINI_DEVICE_CPU, cpu)
++#endif
++#ifdef ENABLE_NVIDIA_API
++        GET(INFINI_DEVICE_NVIDIA, nvidia)
++#endif
++#ifdef ENABLE_QY_API
++        GET(INFINI_DEVICE_QY, nvidia)
++#endif
++#ifdef ENABLE_METAX_API
++        GET(INFINI_DEVICE_METAX, metax)
++#endif
++#ifdef ENABLE_MOORE_API
++        GET(INFINI_DEVICE_MOORE, moore)
++#endif
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++#undef GET
++
++    return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++}
++
++__INFINI_C infiniStatus_t infiniopDist(
++    infiniopDistDescriptor_t desc,
++    void *workspace,
++    size_t workspace_size,
++    void *y,
++    const void *x1,
++    const void *x2,
++    void *stream) {
++
++#define CALCULATE(CASE, NAMESPACE)                                             \
++    case CASE:                                                                 \
++        return reinterpret_cast<const op::dist::NAMESPACE::Descriptor *>(desc) \
++            ->calculate(workspace, workspace_size, y, x1, x2, stream)
++
++    switch (desc->device_type) {
++
++#ifdef ENABLE_CPU_API
++        CALCULATE(INFINI_DEVICE_CPU, cpu);
++#endif
++#ifdef ENABLE_NVIDIA_API
++        CALCULATE(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_QY_API
++        CALCULATE(INFINI_DEVICE_QY, nvidia);
++#endif
++#ifdef ENABLE_METAX_API
++        CALCULATE(INFINI_DEVICE_METAX, metax);
++#endif
++#ifdef ENABLE_MOORE_API
++        CALCULATE(INFINI_DEVICE_MOORE, moore);
++#endif
++
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef CALCULATE
++}
++
++__INFINI_C infiniStatus_t
++infiniopDestroyDistDescriptor(infiniopDistDescriptor_t desc) {
++
++#define DELETE(CASE, NAMESPACE)                                                 \
++    case CASE:                                                                  \
++        delete reinterpret_cast<const op::dist::NAMESPACE::Descriptor *>(desc); \
++        return INFINI_STATUS_SUCCESS;
++
++    switch (desc->device_type) {
++
++#ifdef ENABLE_CPU_API
++        DELETE(INFINI_DEVICE_CPU, cpu);
++#endif
++#ifdef ENABLE_NVIDIA_API
++        DELETE(INFINI_DEVICE_NVIDIA, nvidia);
++#endif
++#ifdef ENABLE_QY_API
++        DELETE(INFINI_DEVICE_QY, nvidia);
++#endif
++#ifdef ENABLE_METAX_API
++        DELETE(INFINI_DEVICE_METAX, metax);
++#endif
++#ifdef ENABLE_MOORE_API
++        DELETE(INFINI_DEVICE_MOORE, moore);
++#endif
++
++    default:
++        return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
++    }
++
++#undef DELETE
++}
+--- a/InfiniCore/src/infinirt/cuda/infinirt_cuda.cu
++++ b/InfiniCore/src/infinirt/cuda/infinirt_cuda.cu
+@@ -280,7 +280,15 @@
+ #endif
+ 
+ infiniStatus_t getDeviceCount(int *count) {
+-    CHECK_CUDART(cudaGetDeviceCount(count));
++    const auto status = cudaGetDeviceCount(count);
++#if defined(ENABLE_HYGON_API)
++    // A build/CPU-only host can legitimately have no DCU devices.
++    if (status == cudaErrorNoDevice) {
++        *count = 0;
++        return INFINI_STATUS_SUCCESS;
++    }
++#endif
++    CHECK_CUDART(status);
+     return INFINI_STATUS_SUCCESS;
+ }
+ 
+--- a/InfiniCore/xmake/hygon.lua
++++ b/InfiniCore/xmake/hygon.lua
+@@ -147,7 +147,7 @@
+     add_files("../src/infiniop/devices/nvidia/*.cu", "../src/infiniop/ops/*/nvidia/*.cu")
+     add_files("../src/infiniop/ops/quant/per_channel_quant_int8/nvidia/*.cu")
+     -- Native Hygon MHA is used by MiniMax-H3 even without flash-attn.
+-    add_files("../src/infinicore/ops/multi_head_attention/hygon/mha_native_hygon.cu")
++    -- Handwritten MHA excluded: real InfiniCore MHA now dispatches NineToothed objects.
+     add_files("../src/infinicore/ops/h3_rotary_cache/hygon/h3_rotary_cache_hygon.cu")
+     add_files("../src/infinicore/ops/cast/hygon/cast_hygon.cu")
+ 
